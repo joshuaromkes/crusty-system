@@ -1,0 +1,62 @@
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Editor directories and files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.project
+.classpath
+.settings/
+
+# Temporary files
+*.tmp
+*.temp
+*.log
+*.bak
+
+# Private keys and secrets - NEVER COMMIT THESE
+*.pem
+*.key
+id_rsa
+id_ed25519
+*.pub
+authorized_keys
+known_hosts
+.ssh/
+
+# Environment files
+.env
+.env.*
+!.env.example
+
+# Backup files created by scripts
+*.backup
+*.backup.*
+
+# Test outputs
+test-output/
+coverage/
+
+# Node modules (if any web components added later)
+node_modules/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+ENV/
+
+# Shell script testing
+.bash_history
