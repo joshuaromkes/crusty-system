@@ -24,7 +24,7 @@ Crusty System is a collection of quick-start scripts designed to automatically c
 
 ## Quick Start
 
-```bash
+
 # SSH Hardener
 curl -sSL https://raw.githubusercontent.com/joshuaromkes/crusty-system/main/scripts/ssh-hardener.sh | sudo bash
 
