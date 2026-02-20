@@ -5,20 +5,24 @@ This document outlines planned features and enhancements for the Crusty System p
 ## Priority 1: Core Scripts
 
 ### SSH Hardener Script
-**Status**: In Planning
+**Status**: Testing
 
 **Features**:
 - Custom SSH port (58432)
 - ED25519 certificate generation
 - UFW firewall configuration
 - Fail2ban intrusion prevention
-- Automatic weekly updates at 2:00 AM
 - Certificate info output for SSH clients
+- Automatic weekly updates at 2:00 AM
+- Backup of existing configurations
 
-**Implementation Notes**:
-- See [SSH-HARDENER.md](../docs/SSH-HARDENER.md) for detailed specifications
-- Must be idempotent
-- Must backup existing configurations
+### Auto Update Script
+**Status**: Implemented
+- Single execution script that creates cronjob and runs automatic updates
+- Automatic weekly updates at 2:00 AM for the local time of the server (or configurable in script runtime)
+- Use ubuntu server package manager (apt get update && apt-get upgrade -y)
+- Idempotent - updates cronjob if already exists
+- Unattended-upgrades package configured
 
 ---
 
@@ -137,35 +141,3 @@ This document outlines planned features and enhancements for the Crusty System p
 - Deployment history
 - Scheduled tasks
 - Alert management
-
----
-
-## Implementation Timeline
-
-```mermaid
-gantt
-    title Crusty System Development Roadmap
-    dateFormat  YYYY-MM
-    section Core Scripts
-    SSH Hardener     :a1, 2026-02, 1M
-    section Infrastructure
-    Docker Setup     :a2, after a1, 1M
-    Nginx Setup      :a3, after a1, 1M
-    section Utilities
-    User Management  :a4, after a2, 1M
-    Backup Config    :a5, after a2, 1M
-    section Advanced
-    Multi-Server     :a6, after a4, 2M
-    Profiles         :a7, after a4, 1M
-```
-
-## Contributing
-
-Want to help implement these features? See [CONTRIBUTING.md](../CONTRIBUTING.md) for guidelines.
-
-## Feature Requests
-
-Have an idea for a new feature? Open an issue with the label `enhancement` and describe:
-- The problem it solves
-- Proposed solution
-- Alternative approaches considered

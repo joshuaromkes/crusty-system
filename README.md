@@ -18,32 +18,27 @@ Crusty System is a collection of quick-start scripts designed to automatically c
 
 | Script | Description | Status |
 |--------|-------------|--------|
-| `ssh-hardener.sh` | SSH and server hardening for Ubuntu Server | Planned |
+| `ssh-hardener.sh` | SSH and server hardening for Ubuntu Server | Ready |
+| `auto-update.sh` | Automatic weekly updates for Ubuntu Server | Ready |
 | `docker-setup.sh` | Docker and Docker Compose installation | Planned |
-| `nginx-setup.sh` | Nginx reverse proxy configuration | Planned |
 
 ## Quick Start
 
 ```bash
-# Clone the repository
-git clone https://github.com/yourusername/crusty-system.git
-cd crusty-system
+# SSH Hardener
+curl -sSL https://raw.githubusercontent.com/joshuaromkes/crusty-system/main/scripts/ssh-hardener.sh | sudo bash
 
-# Run the SSH hardener script
-sudo ./scripts/ssh-hardener.sh
-```
+# Auto Update
+curl -sSL https://raw.githubusercontent.com/joshuaromkes/crusty-system/main/scripts/auto-update.sh | sudo bash
+
+# Docker Setup
+curl -sSL https://raw.githubusercontent.com/joshuaromkes/crusty-system/main/scripts/docker-setup.sh | sudo bash
 
 ## Requirements
 
 - Ubuntu Server 20.04 LTS or newer
 - Root or sudo privileges
 - Internet connection for package installation
-
-## Documentation
-
-- [Architecture Overview](docs/ARCHITECTURE.md)
-- [SSH Hardener Documentation](docs/SSH-HARDENER.md)
-- [Contributing Guide](CONTRIBUTING.md)
 
 ## Security Notice
 
@@ -56,10 +51,4 @@ These scripts are designed to enhance server security. However, security is an o
 
 ## License
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-
-## Acknowledgments
-
-- Ubuntu Server documentation
-- OpenSSH best practices guides
-- Security hardening community resources
+This project is licensed under the MIT License
