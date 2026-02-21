@@ -50,14 +50,30 @@ curl -sSL https://raw.githubusercontent.com/joshuaromkes/crusty-system/main/scri
 
 **What it does:**
 - Prompts for preferred update time (24H format)
-- Configures unattended-upgrades for security updates
 - Creates weekly cron job for system updates
 - Optionally runs updates immediately after setup
 
-**Other Usage Examples:**
+**Usage Examples:**
+
+If the script is **not installed locally**, use curl with arguments:
 ```bash
 # Install with interactive time selection
-auto-update.sh install
+curl -sSL https://raw.githubusercontent.com/joshuaromkes/crusty-system/main/scripts/auto-update.sh | sudo bash
+
+# Run updates immediately (without installing)
+curl -sSL https://raw.githubusercontent.com/joshuaromkes/crusty-system/main/scripts/auto-update.sh | sudo bash -s -- run-now
+
+# Check current configuration
+curl -sSL https://raw.githubusercontent.com/joshuaromkes/crusty-system/main/scripts/auto-update.sh | sudo bash -s -- status
+
+# Uninstall and clean up
+curl -sSL https://raw.githubusercontent.com/joshuaromkes/crusty-system/main/scripts/auto-update.sh | sudo bash -s -- uninstall
+```
+
+If the script is **donwloaded locally**:
+```bash
+# Install with interactive time selection
+sudo ./auto-update.sh install
 
 # Run updates immediately
 sudo ./auto-update.sh run-now

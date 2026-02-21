@@ -202,7 +202,7 @@ install_auto_updates() {
 
     echo ""
     echo -e "${GREEN}To manually trigger an update later, run:${NC}"
-    echo "  $0 run-now"
+    echo "  sudo apt-get update && sudo apt-get upgrade -y"
     echo ""
 }
 
