@@ -24,15 +24,61 @@ Crusty System is a collection of quick-start scripts designed to automatically c
 
 ## Quick Start
 
+### SSH Hardener
 
-# SSH Hardener
+One-line installation:
+```bash
 curl -sSL https://raw.githubusercontent.com/joshuaromkes/crusty-system/main/scripts/ssh-hardener.sh | sudo bash
+```
 
-# Auto Update
+**What it does:**
+- Changes SSH port to 58432
+- Disables password authentication (key-only)
+- Disables root login
+- Installs and configures UFW firewall
+- Installs and configures fail2ban
+- Generates ED25519 SSH key pair
+
+---
+
+### Auto Update
+
+One-line installation:
+```bash
 curl -sSL https://raw.githubusercontent.com/joshuaromkes/crusty-system/main/scripts/auto-update.sh | sudo bash
+```
 
-# Docker Setup
+**What it does:**
+- Prompts for preferred update time (24H format)
+- Configures unattended-upgrades for security updates
+- Creates weekly cron job for system updates
+- Optionally runs updates immediately after setup
+
+**Usage Examples:**
+```bash
+# Install with interactive time selection
+sudo ./auto-update.sh install
+
+# Run updates immediately
+sudo ./auto-update.sh run-now
+
+# Check current configuration
+sudo ./auto-update.sh status
+
+# Uninstall and clean up
+sudo ./auto-update.sh uninstall
+```
+
+---
+
+### Docker Setup
+
+One-line installation:
+```bash
 curl -sSL https://raw.githubusercontent.com/joshuaromkes/crusty-system/main/scripts/docker-setup.sh | sudo bash
+```
+
+**Status:** Planned - Coming soon
 
 ## Requirements
 
