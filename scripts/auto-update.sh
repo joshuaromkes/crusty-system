@@ -51,7 +51,7 @@ prompt_update_time() {
     echo ""
 
     while [[ "$valid" == false ]]; do
-        read -rp "Enter update time (HH:MM): " time_input
+        read -rp "Enter update time (HH:MM): " time_input < /dev/tty
 
         # Check if input matches HH:MM format
         if [[ "$time_input" =~ ^([0-9]{1,2}):([0-9]{2})$ ]]; then
@@ -190,7 +190,7 @@ prompt_run_now() {
     echo ""
     echo -e "${YELLOW}=== Run Updates Now ===${NC}"
     echo ""
-    read -rp "Would you like to run system updates now? [y/N]: " run_now
+    read -rp "Would you like to run system updates now? [y/N]: " run_now < /dev/tty
 
     if [[ "$run_now" =~ ^[Yy]$ ]]; then
         run_updates_now
@@ -232,7 +232,7 @@ uninstall_auto_updates() {
 
     # Optionally remove log files
     echo ""
-    read -rp "Would you like to remove log files as well? [y/N]: " remove_logs
+    read -rp "Would you like to remove log files as well? [y/N]: " remove_logs < /dev/tty
     if [[ "$remove_logs" =~ ^[Yy]$ ]]; then
         log "Removing log files..."
         rm -f /var/log/crusty-update.log
