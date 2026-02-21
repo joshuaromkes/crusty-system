@@ -54,10 +54,10 @@ curl -sSL https://raw.githubusercontent.com/joshuaromkes/crusty-system/main/scri
 - Creates weekly cron job for system updates
 - Optionally runs updates immediately after setup
 
-**Usage Examples:**
+**Other Usage Examples:**
 ```bash
 # Install with interactive time selection
-sudo ./auto-update.sh install
+auto-update.sh install
 
 # Run updates immediately
 sudo ./auto-update.sh run-now
