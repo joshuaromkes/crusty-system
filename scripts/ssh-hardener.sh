@@ -515,7 +515,7 @@ EOF
     fi
     
     log "SSH configuration applied on port $SSH_PORT"
-
+}
 
 # Main execution starts here
 
