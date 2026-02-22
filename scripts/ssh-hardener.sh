@@ -163,6 +163,10 @@ prompt_public_key() {
     echo ""
     echo -e "${RED}DO NOT paste your private key here!${NC}"
     echo ""
+    echo -e "${YELLOW}TIP: If you're using VNC/console and copy-paste doesn't work,${NC}"
+    echo -e "${YELLOW}try using ClickPaste to simulate keystrokes:${NC}"
+    echo -e "${BLUE}  https://github.com/Collective-Software/ClickPaste${NC}"
+    echo ""
     
     local key_valid=false
     while [[ "$key_valid" == false ]]; do
@@ -497,10 +501,21 @@ LogLevel VERBOSE
 EOF
     
     # Restart SSH service
-    systemctl restart sshd || systemctl restart ssh
+    log "Restarting SSH service..."
+    if systemctl restart sshd 2>/dev/null || systemctl restart ssh 2>/dev/null; then
+        log "SSH service restarted successfully"
+    else
+        log_error "Failed to restart SSH service!"
+        echo -e "${RED}ERROR: SSH service failed to restart!${NC}"
+        echo "Restoring backup configuration..."
+        cp "$BACKUP_DIR/sshd_config.backup" /etc/ssh/sshd_config
+        systemctl restart sshd || systemctl restart ssh
+        echo "Backup restored. Please check the configuration and try again."
+        exit 1
+    fi
     
     log "SSH configuration applied on port $SSH_PORT"
-}
+
 
 # Main execution starts here
 
@@ -720,8 +735,21 @@ echo ""
 echo -e "${YELLOW}Log File:${NC}"
 echo "  $LOG_FILE"
 echo ""
-echo -e "${RED}IMPORTANT:${NC}"
-echo "  - Password authentication is now DISABLED"
-echo "  - You MUST use your SSH key to connect"
-echo "  - Keep your private key safe - there is no password fallback!"
+echo -e "${RED}==========================================${NC}"
+echo -e "${RED}              IMPORTANT!${NC}"
+echo -e "${RED}==========================================${NC}"
+echo ""
+echo -e "${YELLOW}1. DO NOT close this session until you've tested the new connection!${NC}"
+echo "   Open a new terminal/SSH window and test connecting with:"
+echo -e "   ${GREEN}ssh -p $SSH_PORT $CURRENT_USER@$(hostname -I | awk '{print $1}')${NC}"
+echo ""
+echo -e "${YELLOW}2. Password authentication is now DISABLED${NC}"
+echo "   You MUST use your SSH key to connect"
+echo ""
+echo -e "${YELLOW}3. Keep your private key safe${NC}"
+echo "   There is no password fallback!"
+echo ""
+echo -e "${GREEN}If the new connection works, you can safely close this session.${NC}"
+echo -e "${RED}If it doesn't work, you can troubleshoot using this current session.${NC}"
+echo ""
 echo ""
