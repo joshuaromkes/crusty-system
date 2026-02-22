@@ -46,6 +46,7 @@ curl -sSL https://raw.githubusercontent.com/joshuaromkes/crusty-system/main/scri
 **What it does:**
 - Prompts for preferred update time (24H format)
 - Creates weekly cron job for system updates
+- Automatically restarts the server after updates are applied
 - Optionally runs updates immediately after setup
 
 **Usage Examples:**

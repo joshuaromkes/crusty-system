@@ -72,7 +72,7 @@ create_cron_job() {
     echo -e "${GREEN}Creating weekly update cron job for ${UPDATE_HOUR}:${UPDATE_MINUTE}...${NC}"
     cat > "$CRON_FILE" << EOF
 # Crusty System - Weekly automatic updates at ${UPDATE_HOUR}:${UPDATE_MINUTE}
-${UPDATE_MINUTE} ${UPDATE_HOUR} * * 0 root /usr/bin/apt-get update && /usr/bin/apt-get upgrade -y
+${UPDATE_MINUTE} ${UPDATE_HOUR} * * 0 root /usr/bin/apt-get update && /usr/bin/apt-get upgrade -y && sudo shutdown -r now
 EOF
     chmod 644 "$CRON_FILE"
 }
@@ -195,6 +195,7 @@ install_auto_updates() {
     echo ""
     echo -e "${GREEN}Configuration Summary:${NC}"
     echo "  - Update Schedule: Weekly at ${UPDATE_HOUR}:${UPDATE_MINUTE} (Sunday)"
+    echo "  - Auto Restart: Enabled (server will restart after updates)"
     echo ""
 
     # Ask if user wants to run updates now

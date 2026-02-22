@@ -343,6 +343,7 @@ prompt_auto_updates() {
     echo ""
     echo "Automatic updates help keep your system secure by installing"
     echo "security patches and updates on a regular schedule."
+    echo "server will restart after updates to ensure all changes take effect."
     echo ""
     
     local response
@@ -692,7 +693,7 @@ EOF
     # Add weekly update cron job at user-specified time (matching auto-update.sh format)
     cat > /etc/cron.d/crusty-auto-update << EOF
 # Crusty System - Weekly automatic updates at ${UPDATE_HOUR}:${UPDATE_MINUTE}
-${UPDATE_MINUTE} ${UPDATE_HOUR} * * 0 root /usr/bin/apt-get update && /usr/bin/apt-get upgrade -y
+${UPDATE_MINUTE} ${UPDATE_HOUR} * * 0 root /usr/bin/apt-get update && /usr/bin/apt-get upgrade -y && sudo shutdown -r now
 EOF
     chmod 644 /etc/cron.d/crusty-auto-update
     
@@ -720,6 +721,7 @@ else
 fi
 if [[ "$ENABLE_AUTO_UPDATES" == true ]]; then
     echo "  - Automatic Updates: Weekly at ${UPDATE_HOUR}:${UPDATE_MINUTE}"
+    echo "  - Auto Restart: Enabled (server will restart after updates)"
 else
     echo "  - Automatic Updates: Not configured"
 fi
