@@ -415,10 +415,19 @@ prompt_update_time() {
 
 # Function to setup authorized_keys with user public key
 setup_authorized_keys() {
-    local ssh_dir="/root/.ssh"
+    # Get the actual user's home directory (not root's)
+    local user_home
+    if [[ -n "$SUDO_USER" ]]; then
+        user_home=$(getent passwd "$SUDO_USER" | cut -d: -f6)
+    else
+        user_home="$HOME"
+    fi
+    
+    local ssh_dir="$user_home/.ssh"
     local auth_keys_file="$ssh_dir/authorized_keys"
     
-    log "Setting up authorized_keys..."
+    log "Setting up authorized_keys for user: $CURRENT_USER"
+    log "Home directory: $user_home"
     
     # Create .ssh directory if it doesn't exist
     mkdir -p "$ssh_dir"
@@ -430,7 +439,14 @@ setup_authorized_keys() {
     
     # Add user's public key
     echo "$USER_PUBLIC_KEY" > "$auth_keys_file"
-    log "User's public key added to authorized_keys"
+    
+    # Set proper ownership to the actual user (not root)
+    if [[ -n "$SUDO_USER" ]]; then
+        chown -R "$SUDO_USER:$SUDO_USER" "$ssh_dir"
+        log "Ownership set to $SUDO_USER:$SUDO_USER"
+    fi
+    
+    log "User's public key added to $auth_keys_file"
 }
 
 # Function to apply SSH configuration
