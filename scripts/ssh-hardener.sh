@@ -40,6 +40,68 @@ if [[ $EUID -ne 0 ]]; then
     exit 1
 fi
 
+# Function to check and install OpenSSH server
+check_and_install_openssh() {
+    log "Checking for OpenSSH server installation..."
+    
+    # Check if sshd command exists
+    if command -v sshd &> /dev/null; then
+        log "OpenSSH server is already installed"
+        return 0
+    fi
+    
+    # Check if openssh-server package is installed
+    if dpkg -l | grep -q "^ii  openssh-server"; then
+        log "OpenSSH server package is installed but sshd not in PATH"
+        return 0
+    fi
+    
+    log_warn "OpenSSH server is not installed"
+    echo ""
+    echo -e "${YELLOW}OpenSSH server is required for this script to function.${NC}"
+    echo "It provides the SSH daemon (sshd) that allows remote SSH connections."
+    echo ""
+    
+    local response
+    while true; do
+        read -rp "Do you want to install OpenSSH server now? (yes/no) [default: yes]: " response < /dev/tty
+        response=${response:-yes}
+        case "$response" in
+            [Yy][Ee][Ss])
+                log "Installing OpenSSH server..."
+                echo -e "${GREEN}Installing OpenSSH server...${NC}"
+                if apt-get update -qq && apt-get install -y -qq openssh-server; then
+                    log "OpenSSH server installed successfully"
+                    echo -e "${GREEN}OpenSSH server installed successfully!${NC}"
+                    
+                    # Start and enable the SSH service
+                    systemctl start sshd 2>/dev/null || systemctl start ssh 2>/dev/null || true
+                    systemctl enable sshd 2>/dev/null || systemctl enable ssh 2>/dev/null || true
+                    
+                    return 0
+                else
+                    log_error "Failed to install OpenSSH server"
+                    echo -e "${RED}ERROR: Failed to install OpenSSH server.${NC}"
+                    echo "Please install it manually and run this script again."
+                    exit 1
+                fi
+                ;;
+            [Nn][Oo])
+                log_error "OpenSSH server is required. Exiting."
+                echo -e "${RED}ERROR: OpenSSH server is required for SSH hardening.${NC}"
+                echo "Please install it manually and run this script again."
+                exit 1
+                ;;
+            *)
+                echo "Please answer 'yes' or 'no'."
+                ;;
+        esac
+    done
+}
+
+# Check and install OpenSSH server before proceeding
+check_and_install_openssh
+
 # Function to prompt user for confirmation to proceed
 prompt_confirmation() {
     echo ""

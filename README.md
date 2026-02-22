@@ -55,9 +55,6 @@ If the script is **not downloaded locally**, use curl with arguments:
 # Install with interactive time selection
 curl -sSL https://raw.githubusercontent.com/joshuaromkes/crusty-system/main/scripts/auto-update.sh | sudo bash
 
-# Run updates immediately (without installing)
-curl -sSL https://raw.githubusercontent.com/joshuaromkes/crusty-system/main/scripts/auto-update.sh | sudo bash -s -- run-now
-
 # Check current configuration
 curl -sSL https://raw.githubusercontent.com/joshuaromkes/crusty-system/main/scripts/auto-update.sh | sudo bash -s -- status
 
