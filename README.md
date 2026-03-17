@@ -22,7 +22,7 @@ Crusty System is a collection of quick-start scripts designed to automatically c
 
 One-line installation:
 ```bash
-curl -sSL https://YOUR_GITHUB_PAT@raw.githubusercontent.com/joshuaromkes/crusty-system/main/Ubuntu/ssh-hardener.sh | sudo bash
+curl -sSL https://raw.githubusercontent.com/joshuaromkes/crusty-system/main/scripts/ubuntu/ssh-hardener.sh | sudo bash
 ```
 
 **What it does:**
@@ -48,13 +48,13 @@ curl -sSL https://YOUR_GITHUB_PAT@raw.githubusercontent.com/joshuaromkes/crusty-
 If the script is **not downloaded locally**, use curl with arguments:
 ```bash
 # Install with interactive time selection
-curl -sSL https://YOUR_GITHUB_PAT@raw.githubusercontent.com/joshuaromkes/crusty-system/main/Ubuntu/auto-update.sh | sudo bash
+curl -sSL https://raw.githubusercontent.com/joshuaromkes/crusty-system/main/scripts/ubuntu/auto-update.sh | sudo bash
 
 # Check current configuration
-curl -sSL https://YOUR_GITHUB_PAT@raw.githubusercontent.com/joshuaromkes/crusty-system/main/Ubuntu/auto-update.sh | sudo bash -s -- status
+curl -sSL https://raw.githubusercontent.com/joshuaromkes/crusty-system/main/scripts/ubuntu/auto-update.sh | sudo bash -s -- status
 
 # Uninstall and clean up
-curl -sSL https://YOUR_GITHUB_PAT@raw.githubusercontent.com/joshuaromkes/crusty-system/main/Ubuntu/auto-update.sh | sudo bash -s -- uninstall
+curl -sSL https://raw.githubusercontent.com/joshuaromkes/crusty-system/main/scripts/ubuntu/auto-update.sh | sudo bash -s -- uninstall
 ```
 
 If the script is **downloaded locally**:
@@ -78,7 +78,7 @@ sudo ./auto-update.sh uninstall
 
 One-line installation:
 ```bash
-curl -sSL https://YOUR_GITHUB_PAT@raw.githubusercontent.com/joshuaromkes/crusty-system/main/Ubuntu/docker-setup.sh | sudo bash
+curl -sSL https://raw.githubusercontent.com/joshuaromkes/crusty-system/main/scripts/ubuntu/docker-setup.sh | sudo bash
 ```
 ---
 
@@ -86,7 +86,7 @@ curl -sSL https://YOUR_GITHUB_PAT@raw.githubusercontent.com/joshuaromkes/crusty-
 
 One-line installation:
 ```bash
-curl -sSL https://YOUR_GITHUB_PAT@raw.githubusercontent.com/joshuaromkes/crusty-system/main/Arch/install-rustdesk.sh | sudo bash
+curl -sSL https://raw.githubusercontent.com/joshuaromkes/crusty-system/main/scripts/arch/install-rustdesk.sh | sudo bash
 ```
 
 **What it does:**
@@ -104,7 +104,7 @@ curl -sSL https://YOUR_GITHUB_PAT@raw.githubusercontent.com/joshuaromkes/crusty-
 
 One-line installation:
 ```bash
-curl -sSL https://YOUR_GITHUB_PAT@raw.githubusercontent.com/joshuaromkes/crusty-system/main/Arch/install-monitor-manager.sh | sudo bash
+curl -sSL https://raw.githubusercontent.com/joshuaromkes/crusty-system/main/scripts/arch/install-monitor-manager.sh | sudo bash
 ```
 
 **What it does:**
@@ -119,17 +119,17 @@ curl -sSL https://YOUR_GITHUB_PAT@raw.githubusercontent.com/joshuaromkes/crusty-
 If the script is **not downloaded locally**, use curl with arguments:
 ```bash
 # Interactive TUI menu (recommended)
-curl -sSL https://YOUR_GITHUB_PAT@raw.githubusercontent.com/joshuaromkes/crusty-system/main/Arch/install-monitor-manager.sh | sudo bash
+curl -sSL https://raw.githubusercontent.com/joshuaromkes/crusty-system/main/scripts/arch/install-monitor-manager.sh | sudo bash
 
 # Or use direct commands:
 # Install with interactive TUI setup
-curl -sSL https://YOUR_GITHUB_PAT@raw.githubusercontent.com/joshuaromkes/crusty-system/main/Arch/install-monitor-manager.sh | sudo bash -s -- setup
+curl -sSL https://raw.githubusercontent.com/joshuaromkes/crusty-system/main/scripts/arch/install-monitor-manager.sh | sudo bash -s -- setup
 
 # Check current status
-curl -sSL https://YOUR_GITHUB_PAT@raw.githubusercontent.com/joshuaromkes/crusty-system/main/Arch/install-monitor-manager.sh | sudo bash -s -- status
+curl -sSL https://raw.githubusercontent.com/joshuaromkes/crusty-system/main/scripts/arch/install-monitor-manager.sh | sudo bash -s -- status
 
 # Uninstall
-curl -sSL https://YOUR_GITHUB_PAT@raw.githubusercontent.com/joshuaromkes/crusty-system/main/Arch/install-monitor-manager.sh | sudo bash -s -- uninstall
+curl -sSL https://raw.githubusercontent.com/joshuaromkes/crusty-system/main/scripts/arch/install-monitor-manager.sh | sudo bash -s -- uninstall
 ```
 
 If the script is **downloaded locally**:

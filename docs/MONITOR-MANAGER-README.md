@@ -47,7 +47,7 @@ Monitor Manager is an automated monitor switching system designed for Arch Linux
 ### One-Line Installation
 
 ```bash
-curl -sSL https://YOUR_GITHUB_PAT@raw.githubusercontent.com/joshuaromkes/crusty-system/main/Arch/install-monitor-manager.sh | sudo bash
+curl -sSL https://raw.githubusercontent.com/joshuaromkes/crusty-system/main/scripts/arch/install-monitor-manager.sh | sudo bash
 ```
 
 This will launch an interactive TUI menu where you can choose to:
@@ -60,7 +60,7 @@ This will launch an interactive TUI menu where you can choose to:
 
 ```bash
 git clone https://github.com/joshuaromkes/crusty-system.git
-cd crusty-system/Arch
+cd crusty-system/scripts/arch
 sudo ./install-monitor-manager.sh
 ```
 

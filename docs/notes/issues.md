@@ -12,7 +12,7 @@ Monitor Manager was causing monitors to move around on every refresh cycle, and 
 
 ### Root Cause
 
-The `get_output_status()` function in [`monitor-manager.sh`](../Arch/monitor-manager.sh) was incorrectly parsing `kscreen-doctor -o` output due to **two separate issues**:
+The `get_output_status()` function in [`monitor-manager.sh`](../../scripts/arch/monitor-manager.sh) was incorrectly parsing `kscreen-doctor -o` output due to **two separate issues**:
 
 **Issue 1: ANSI Color Codes**
 `kscreen-doctor` outputs ANSI color codes (e.g., `[01;32m`, `[0;0m`) which interfered with field extraction in awk. The script was trying to match field `$3` but the color codes shifted the field positions.
@@ -71,8 +71,8 @@ But `kscreen-doctor -o` showed both monitors were actually connected and enabled
 
 ### Files Modified
 
-- [`Arch/monitor-manager.sh`](../Arch/monitor-manager.sh) - Fixed parsing and added cooldown
-- [`Arch/MONITOR-MANAGER-README.md`](../Arch/MONITOR-MANAGER-README.md) - Added troubleshooting section
+- [`scripts/arch/monitor-manager.sh`](../../scripts/arch/monitor-manager.sh) - Fixed parsing and added cooldown
+- [`docs/MONITOR-MANAGER-README.md`](../MONITOR-MANAGER-README.md) - Added troubleshooting section
 
 ### Testing Recommendations
 

@@ -5,7 +5,7 @@ Implement a user-space monitor management system for Arch/CachyOS (KDE Plasma Wa
 - Automatically disables a configurable \"dummy\" output (headless monitor) when a configurable \"primary\" output is detected/connected.
 - Re-enables the dummy output (sets position, mode, ensures primary) when primary is not detected.
 - Runs as a systemd **user** service + timer (polling every 5s after 10s boot delay) to avoid root permission issues with kscreen-doctor.
-- Installer script: `Arch/install-monitor-manager.sh` following `install-rustdesk.sh` style (colors, logging, root check, SUDO_USER handling).
+- Installer script: `scripts/arch/install-monitor-manager.sh` following `install-rustdesk.sh` style (colors, logging, root check, SUDO_USER handling).
 - TUI setup using [`whiptail`](dialog package) for selecting primary/dummy from current outputs.
 - Config: `~/.config/monitor-manager/config` (simple INI-like).
 - Commands: `setup` (TUI config), `status` (show config/state), `uninstall`.
@@ -75,9 +75,9 @@ graph TD
 
 ## File Structure
 ```
-Arch/
+scripts/arch/
 ├── install-monitor-manager.sh     # Installer (like rustdesk.sh)
-plans/monitor-manager-plan.md      # This file
+docs/plans/monitor-manager-plan.md # This file
 /usr/local/bin/
 ├── monitor-manager.sh             # Daemon logic
 ~/.config/monitor-manager/
@@ -108,7 +108,7 @@ Add table row:
 Section:
 ```
 ### Monitor Manager
-One-line: `curl -sSL https://.../Arch/install-monitor-manager.sh | sudo bash`
+One-line: `curl -sSL https://.../scripts/arch/install-monitor-manager.sh | sudo bash`
 
 **What it does:**
 - Interactive TUI to select primary/dummy outputs.
