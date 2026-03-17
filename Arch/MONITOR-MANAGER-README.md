@@ -165,11 +165,22 @@ systemctl --user restart monitor-manager.service
 
 - **Daemon logs**: `~/.local/share/monitor-manager/monitor-manager.log`
 - **Install logs**: `/var/log/monitor-manager-install.log`
+- **Systemd journal**: `journalctl --user -u monitor-manager.service`
 
 ### View Recent Logs
 
 ```bash
+# View daemon log file
 tail -f ~/.local/share/monitor-manager/monitor-manager.log
+
+# View last 100 lines of daemon log
+tail -n 100 ~/.local/share/monitor-manager/monitor-manager.log
+
+# View systemd journal logs (real-time)
+journalctl --user -u monitor-manager.service -f
+
+# View last 100 journal entries
+journalctl --user -u monitor-manager.service -n 100 --no-pager
 ```
 
 ## Troubleshooting
@@ -207,6 +218,45 @@ tail -f ~/.local/share/monitor-manager/monitor-manager.log
    ```bash
    tail -n 50 ~/.local/share/monitor-manager/monitor-manager.log
    ```
+
+### Monitors Moving Around / Dummy Flickering
+
+If monitors are moving positions or the dummy monitor appears to enable/disable repeatedly:
+
+1. **Check the daemon logs** to see if status detection is working:
+   ```bash
+   tail -n 100 ~/.local/share/monitor-manager/monitor-manager.log
+   ```
+   
+   Look for lines like:
+   - `Status: primary=connected enabled, dummy=connected enabled` (correct)
+   - `Status: primary=disconnected, dummy=disconnected` (incorrect if monitors are actually connected)
+
+2. **Verify kscreen-doctor output format** matches what the script expects:
+   ```bash
+   kscreen-doctor -o
+   ```
+   
+   The output should show multi-line blocks with "enabled" and "connected" keywords.
+
+3. **Check for rapid state changes** in the journal:
+   ```bash
+   journalctl --user -u monitor-manager.service -n 50 --no-pager
+   ```
+   
+   If you see the same action repeated every poll interval, the status detection may be failing.
+
+4. **Increase poll interval** to reduce frequency of checks (edit `~/.config/monitor-manager/config`):
+   ```bash
+   poll_interval=30  # or higher
+   ```
+
+5. **Restart the service** after making changes:
+   ```bash
+   systemctl --user restart monitor-manager.service
+   ```
+
+**Note**: Version 1.1+ includes fixes for kscreen-doctor output parsing and adds a cooldown mechanism to prevent rapid state changes.
 
 ### Permission Issues
 

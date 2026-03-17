@@ -28,15 +28,24 @@ LOG_FILE="/var/log/monitor-manager-install.log"
 
 # Logging functions
 log() {
-    echo -e "${GREEN}[$(date +'%Y-%m-%d %H:%M:%S')]${NC} $1" | sudo tee -a "$LOG_FILE"
+    local msg
+    msg="[$(date +'%Y-%m-%d %H:%M:%S')] $1"
+    echo "$msg" | sudo tee -a "$LOG_FILE" > /dev/null
+    echo -e "${GREEN}${msg}${NC}" >&2
 }
 
 log_warn() {
-    echo -e "${YELLOW}[$(date +'%Y-%m-%d %H:%M:%S')] WARNING:${NC} $1" | sudo tee -a "$LOG_FILE"
+    local msg
+    msg="[$(date +'%Y-%m-%d %H:%M:%S')] WARNING: $1"
+    echo "$msg" | sudo tee -a "$LOG_FILE" > /dev/null
+    echo -e "${YELLOW}${msg}${NC}" >&2
 }
 
 log_error() {
-    echo -e "${RED}[$(date +'%Y-%m-%d %H:%M:%S')] ERROR:${NC} $1" | sudo tee -a "$LOG_FILE"
+    local msg
+    msg="[$(date +'%Y-%m-%d %H:%M:%S')] ERROR: $1"
+    echo "$msg" | sudo tee -a "$LOG_FILE" > /dev/null
+    echo -e "${RED}${msg}${NC}" >&2
 }
 
 # Check if running as root
@@ -57,7 +66,27 @@ get_user() {
         exit 1
     fi
     USER_HOME=$(eval echo "~$ACTUAL_USER")
-    log "Detected user: $ACTUAL_USER (home: $USER_HOME)"
+    USER_UID=$(id -u "$ACTUAL_USER")
+    USER_RUNTIME_DIR="/run/user/$USER_UID"
+    
+    # Detect Wayland display from the runtime directory
+    # Look for wayland-* sockets in XDG_RUNTIME_DIR
+    WAYLAND_DISPLAY=""
+    if [[ -d "$USER_RUNTIME_DIR" ]]; then
+        # Find the first wayland socket (usually wayland-0)
+        WAYLAND_DISPLAY=$(ls "$USER_RUNTIME_DIR" 2>/dev/null | grep -m1 '^wayland-[0-9]*$' || echo "")
+    fi
+    
+    # Fallback to wayland-0 if not found
+    if [[ -z "$WAYLAND_DISPLAY" ]]; then
+        WAYLAND_DISPLAY="wayland-0"
+    fi
+    
+    # Try to detect DISPLAY from the user's session (for XWayland apps)
+    DISPLAY=":0"
+    
+    log "Detected user: $ACTUAL_USER (home: $USER_HOME, uid: $USER_UID)"
+    log "Display environment: WAYLAND_DISPLAY=$WAYLAND_DISPLAY, DISPLAY=$DISPLAY"
 }
 
 # Install dependencies
@@ -93,17 +122,33 @@ install_dependencies() {
 # Parse kscreen-doctor output to get list of outputs
 get_outputs() {
     local outputs_raw
-    local user_runtime_dir="/run/user/$(id -u "$ACTUAL_USER")"
-    outputs_raw=$(sudo -u "$ACTUAL_USER" XDG_RUNTIME_DIR="$user_runtime_dir" kscreen-doctor -o 2>/dev/null || echo "")
     
-    if [[ -z "$outputs_raw" ]]; then
-        log_error "Failed to get outputs from kscreen-doctor"
+    # Run kscreen-doctor with full Wayland/X11 environment
+    outputs_raw=$(sudo -u "$ACTUAL_USER" \
+        XDG_RUNTIME_DIR="$USER_RUNTIME_DIR" \
+        WAYLAND_DISPLAY="$WAYLAND_DISPLAY" \
+        DISPLAY="$DISPLAY" \
+        kscreen-doctor -o 2>&1)
+    
+    local exit_code=$?
+    
+    if [[ -z "$outputs_raw" ]] || [[ $exit_code -ne 0 ]]; then
+        log_error "Failed to get outputs from kscreen-doctor (exit: $exit_code)"
         return 1
     fi
     
-    # Parse output names (e.g., "Output: 123 HDMI-A-1 enabled connected")
-    # Extract just the output names using awk for more robust parsing
-    echo "$outputs_raw" | awk '/^Output:/ {print $3}' || echo ""
+    # Strip ANSI escape codes from the output
+    # kscreen-doctor outputs colored text which breaks pattern matching
+    local outputs_clean
+    outputs_clean=$(echo "$outputs_raw" | sed 's/\x1b\[[0-9;]*m//g')
+    
+    # Parse output names (e.g., "Output: 1 HDMI-A-1 ...")
+    # The format is "Output: <id> <name> <uuid>"
+    # We need field 3 which is the output name (HDMI-A-1, DP-1, etc.)
+    local parsed_outputs
+    parsed_outputs=$(echo "$outputs_clean" | sed -n 's/^Output: [0-9]* \([^ ]*\) .*/\1/p')
+    
+    echo "$parsed_outputs"
 }
 
 # TUI: Select primary monitor
@@ -373,11 +418,11 @@ enable_service() {
     log "Enabling and starting monitor-manager service..."
     
     # Reload systemd user daemon
-    sudo -u "$ACTUAL_USER" XDG_RUNTIME_DIR="/run/user/$(id -u "$ACTUAL_USER")" systemctl --user daemon-reload
+    sudo -u "$ACTUAL_USER" XDG_RUNTIME_DIR="$USER_RUNTIME_DIR" systemctl --user daemon-reload
     
     # Enable and start the service
-    sudo -u "$ACTUAL_USER" XDG_RUNTIME_DIR="/run/user/$(id -u "$ACTUAL_USER")" systemctl --user enable monitor-manager.service
-    sudo -u "$ACTUAL_USER" XDG_RUNTIME_DIR="/run/user/$(id -u "$ACTUAL_USER")" systemctl --user start monitor-manager.service
+    sudo -u "$ACTUAL_USER" XDG_RUNTIME_DIR="$USER_RUNTIME_DIR" systemctl --user enable monitor-manager.service
+    sudo -u "$ACTUAL_USER" XDG_RUNTIME_DIR="$USER_RUNTIME_DIR" systemctl --user start monitor-manager.service
     
     log "Service enabled and started successfully"
     echo -e "${GREEN}Service enabled and started successfully.${NC}"
@@ -401,7 +446,7 @@ show_status() {
     fi
     
     echo -e "${GREEN}Service Status:${NC}"
-    sudo -u "$ACTUAL_USER" XDG_RUNTIME_DIR="/run/user/$(id -u "$ACTUAL_USER")" systemctl --user status monitor-manager.service --no-pager || true
+    sudo -u "$ACTUAL_USER" XDG_RUNTIME_DIR="$USER_RUNTIME_DIR" systemctl --user status monitor-manager.service --no-pager || true
     echo ""
     
     echo -e "${GREEN}Recent Logs:${NC}"
@@ -419,14 +464,14 @@ uninstall() {
     log "Uninstalling monitor-manager..."
     
     echo -e "${YELLOW}Stopping and disabling service...${NC}"
-    sudo -u "$ACTUAL_USER" XDG_RUNTIME_DIR="/run/user/$(id -u "$ACTUAL_USER")" systemctl --user stop monitor-manager.service 2>/dev/null || true
-    sudo -u "$ACTUAL_USER" XDG_RUNTIME_DIR="/run/user/$(id -u "$ACTUAL_USER")" systemctl --user disable monitor-manager.service 2>/dev/null || true
+    sudo -u "$ACTUAL_USER" XDG_RUNTIME_DIR="$USER_RUNTIME_DIR" systemctl --user stop monitor-manager.service 2>/dev/null || true
+    sudo -u "$ACTUAL_USER" XDG_RUNTIME_DIR="$USER_RUNTIME_DIR" systemctl --user disable monitor-manager.service 2>/dev/null || true
     
     echo -e "${YELLOW}Removing files...${NC}"
     rm -f "/usr/local/bin/monitor-manager.sh"
     rm -f "$USER_HOME/.config/systemd/user/monitor-manager.service"
     
-    sudo -u "$ACTUAL_USER" XDG_RUNTIME_DIR="/run/user/$(id -u "$ACTUAL_USER")" systemctl --user daemon-reload
+    sudo -u "$ACTUAL_USER" XDG_RUNTIME_DIR="$USER_RUNTIME_DIR" systemctl --user daemon-reload
     
     echo ""
     echo -e "${GREEN}Monitor Manager uninstalled successfully.${NC}"

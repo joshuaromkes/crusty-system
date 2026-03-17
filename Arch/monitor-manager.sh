@@ -76,29 +76,49 @@ get_output_status() {
         return
     fi
     
-    # Parse output line for the specified output using awk for robust field extraction
-    # Example: "Output: 123 HDMI-A-1 enabled connected priority 1"
-    # Fields: $1=Output: $2=ID $3=NAME $4+=status_words
-    local output_line
-    output_line=$(echo "$kscreen_output" | awk -v name="$output_name" '$3 == name {print}' || echo "")
+    # Strip ANSI color codes that kscreen-doctor adds
+    # These interfere with parsing (e.g., [01;32m, [0;0m)
+    kscreen_output=$(echo "$kscreen_output" | sed 's/\x1b\[[0-9;]*m//g')
     
-    if [[ -z "$output_line" ]]; then
+    # kscreen-doctor output is multi-line per output:
+    # Output: 1 HDMI-A-1 uuid
+    #         enabled
+    #         connected
+    #         priority 2
+    # We need to capture the entire block for the specified output
+    
+    local output_block
+    # Extract the full block: from "Output: X NAME" until the next "Output:" or end
+    output_block=$(echo "$kscreen_output" | awk -v name="$output_name" '
+        /^Output:/ {
+            if (found) exit
+            if ($3 == name) {
+                found=1
+                print
+                next
+            }
+        }
+        found {
+            if (/^Output:/) exit
+            print
+        }
+    ')
+    
+    if [[ -z "$output_block" ]]; then
         echo "unknown"
         return
     fi
     
-    # Extract status words (everything after field 3)
-    local status_words
-    status_words=$(echo "$output_line" | awk '{for(i=4;i<=NF;i++) printf "%s ", $i}')
-    
     local is_connected=false
     local is_enabled=false
     
-    if echo "$status_words" | grep -qw "connected"; then
+    # Check for "connected" keyword in the block
+    if echo "$output_block" | grep -qw "connected"; then
         is_connected=true
     fi
     
-    if echo "$status_words" | grep -qw "enabled"; then
+    # Check for "enabled" keyword in the block
+    if echo "$output_block" | grep -qw "enabled"; then
         is_enabled=true
     fi
     
@@ -174,6 +194,9 @@ monitor_loop() {
     
     local last_primary_status=""
     local last_dummy_status=""
+    local last_action=""
+    local last_action_time=0
+    local cooldown_period=10  # Wait 10 seconds after making changes before acting again
     
     while true; do
         # Get current status
@@ -190,28 +213,54 @@ monitor_loop() {
             last_dummy_status="$dummy_status"
         fi
         
+        # Check if we're in cooldown period
+        local current_time
+        current_time=$(date +%s)
+        local time_since_action=$((current_time - last_action_time))
+        
+        if [[ $time_since_action -lt $cooldown_period ]] && [[ -n "$last_action" ]]; then
+            # Still in cooldown, skip action
+            sleep "$poll_interval"
+            continue
+        fi
+        
         # Decision logic
         if [[ "$primary_status" == "connected enabled" ]] || [[ "$primary_status" == "connected disabled" ]]; then
             # Primary is connected - ensure it's enabled and set as primary
             if [[ "$primary_status" == "connected disabled" ]]; then
                 log "Primary monitor connected but disabled, enabling..."
                 kscreen-doctor "output.${primary_output}.enable" &>> "$LOG_FILE" || true
+                last_action="enable_primary"
+                last_action_time=$(date +%s)
+                sleep 2  # Brief pause to let the change take effect
             fi
             
-            # Set primary as primary display
-            set_primary "$primary_output"
+            # Set primary as primary display (only if not already done recently)
+            if [[ "$last_action" != "set_primary_as_primary" ]]; then
+                set_primary "$primary_output"
+                last_action="set_primary_as_primary"
+                last_action_time=$(date +%s)
+            fi
             
             # Disable dummy if it's enabled
             if [[ "$dummy_status" == "connected enabled" ]]; then
                 disable_dummy
+                last_action="disable_dummy"
+                last_action_time=$(date +%s)
             fi
         else
             # Primary is not connected - enable dummy
             if [[ "$dummy_status" == "connected disabled" ]] || [[ "$dummy_status" == "disconnected" ]]; then
                 enable_dummy
+                last_action="enable_dummy"
+                last_action_time=$(date +%s)
             elif [[ "$dummy_status" == "connected enabled" ]]; then
-                # Dummy already enabled, ensure it's primary
-                set_primary "$dummy_output"
+                # Dummy already enabled, ensure it's primary (only if not already done recently)
+                if [[ "$last_action" != "set_dummy_as_primary" ]]; then
+                    set_primary "$dummy_output"
+                    last_action="set_dummy_as_primary"
+                    last_action_time=$(date +%s)
+                fi
             fi
         fi
         
