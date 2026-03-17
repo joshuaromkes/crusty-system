@@ -1,26 +1,21 @@
 # Crusty System
 
-> Automated server configuration and hardening scripts for Ubuntu Server
+> Automated configuration and hardening scripts for Linux and Windows.
 
 ## Overview
 
-Crusty System is a collection of quick-start scripts designed to automatically configure servers and services with a single command. When a new system is provisioned, simply execute the appropriate script to set up everything with security best practices.
+Crusty System is a collection of quick-start scripts designed to automatically configures and services with a single command. When a new system is provisioned, simply execute the appropriate script to set up everything with security best practices.
 
-## Features
-
-- **SSH Hardening**: Secure SSH configuration with certificate-based authentication
-- **Firewall Setup**: UFW configuration with sensible defaults
-- **Intrusion Prevention**: Fail2ban setup to protect against brute-force attacks
-- **Automatic Updates**: Weekly security and general updates via cron
-- **Root Protection**: Disabled root login with secure alternatives
-
+## Available Scripts
 ## Available Scripts
 
 | Script | Description | Status |
 |--------|-------------|--------|
-| `ssh-hardener.sh` | SSH and server hardening for Ubuntu Server | Ready |
-| `auto-update.sh` | Automatic weekly updates for Ubuntu Server | Ready |
-| `docker-setup.sh` | Docker and Docker Compose installation | Planned |
+| `ssh-hardener.sh` | SSH and hardening for Ubuntu | Ready |
+| `auto-update.sh` | Automatic weekly updates for Ubuntu | Ready |
+
+| `install-rustdesk.sh` | RustDesk Flatpak installer for Arch Linux (Wayland) | Ready |
+
 
 ## Quick Start
 
@@ -28,7 +23,7 @@ Crusty System is a collection of quick-start scripts designed to automatically c
 
 One-line installation:
 ```bash
-curl -sSL https://raw.githubusercontent.com/joshuaromkes/crusty-system/main/scripts/ssh-hardener.sh | sudo bash
+curl -sSL https://YOUR_GITHUB_PAT@raw.githubusercontent.com/joshuaromkes/crusty-system/main/Ubuntu/ssh-hardener.sh | sudo bash
 ```
 
 **What it does:**
@@ -46,7 +41,7 @@ curl -sSL https://raw.githubusercontent.com/joshuaromkes/crusty-system/main/scri
 **What it does:**
 - Prompts for preferred update time (24H format)
 - Creates weekly cron job for system updates
-- Automatically restarts the server after updates are applied
+- Automatically restarts the after updates are applied
 - Optionally runs updates immediately after setup
 
 **Usage Examples:**
@@ -54,13 +49,13 @@ curl -sSL https://raw.githubusercontent.com/joshuaromkes/crusty-system/main/scri
 If the script is **not downloaded locally**, use curl with arguments:
 ```bash
 # Install with interactive time selection
-curl -sSL https://raw.githubusercontent.com/joshuaromkes/crusty-system/main/scripts/auto-update.sh | sudo bash
+curl -sSL https://YOUR_GITHUB_PAT@raw.githubusercontent.com/joshuaromkes/crusty-system/main/Ubuntu/auto-update.sh | sudo bash
 
 # Check current configuration
-curl -sSL https://raw.githubusercontent.com/joshuaromkes/crusty-system/main/scripts/auto-update.sh | sudo bash -s -- status
+curl -sSL https://YOUR_GITHUB_PAT@raw.githubusercontent.com/joshuaromkes/crusty-system/main/Ubuntu/auto-update.sh | sudo bash -s -- status
 
 # Uninstall and clean up
-curl -sSL https://raw.githubusercontent.com/joshuaromkes/crusty-system/main/scripts/auto-update.sh | sudo bash -s -- uninstall
+curl -sSL https://YOUR_GITHUB_PAT@raw.githubusercontent.com/joshuaromkes/crusty-system/main/Ubuntu/auto-update.sh | sudo bash -s -- uninstall
 ```
 
 If the script is **downloaded locally**:
@@ -84,14 +79,29 @@ sudo ./auto-update.sh uninstall
 
 One-line installation:
 ```bash
-curl -sSL https://raw.githubusercontent.com/joshuaromkes/crusty-system/main/scripts/docker-setup.sh | sudo bash
+curl -sSL https://YOUR_GITHUB_PAT@raw.githubusercontent.com/joshuaromkes/crusty-system/main/Ubuntu/docker-setup.sh | sudo bash
+```
+---
+
+### RustDesk Flatpak Installer
+
+One-line installation:
+```bash
+curl -sSL https://YOUR_GITHUB_PAT@raw.githubusercontent.com/joshuaromkes/crusty-system/main/Arch/install-rustdesk.sh | sudo bash
 ```
 
-**Status:** Planned - Coming soon
+**What it does:**
+- Installs Flatpak (if not present) and adds Flathub remote
+- Installs RustDesk Flatpak for Arch Linux (Wayland)
+- Configures xdg-desktop-portal-kde for KDE Plasma Wayland
+- Sets permission for unattended screen sharing (`kde-authorized remote-desktop`)
+- Starts RustDesk in the background
+
+**Note:** This script is designed for Arch Linux with KDE Plasma Wayland. For other desktop environments, the permission command may need adjustment.
+
 
 ## Requirements
 
-- Ubuntu Server 20.04 LTS or newer
 - Root or sudo privileges
 - Internet connection for package installation
 

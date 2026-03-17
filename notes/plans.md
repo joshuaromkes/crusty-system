@@ -141,3 +141,8 @@ This document outlines planned features and enhancements for the Crusty System p
 - Deployment history
 - Scheduled tasks
 - Alert management
+
+
+- Add Primary Script that permits the easy execution of other scripts. Script will be one-line command that can be executed from anywhere.
+
+| `docker-setup.sh` | Docker and Docker Compose installation | Planned |
