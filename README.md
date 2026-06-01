@@ -1,6 +1,6 @@
 # Crusty System
 
-> Automated configuration and hardening scripts for Linux and Windows.
+> Automated configuration and hardening scripts for Linux.
 
 ## Overview
 
@@ -10,13 +10,15 @@ Crusty System is a collection of quick-start scripts designed to automatically c
 
 | Script | Description | Status |
 |--------|-------------|--------|
-| `ssh-hardener.sh` | SSH and hardening for Ubuntu | Ready |
-| `auto-update.sh` | Automatic weekly updates for Ubuntu | Ready |
-
+| `ssh-hardener.sh` | SSH and hardening for Debian/Ubuntu | Ready |
+| `auto-update.sh` | Automatic weekly updates for Debian/Ubuntu | Ready |
+| `setup.sh` | Full system setup for Alpine Linux (packages, SSH, UFW, fail2ban, auto-updates) | Ready |
 
 ## Quick Start
 
-### SSH Hardener
+### Debian/Ubuntu
+
+#### SSH Hardener
 
 One-line installation:
 ```bash
@@ -31,58 +33,74 @@ curl -sSL https://raw.githubusercontent.com/joshuaromkes/crusty-system/main/scri
 - Installs and configures fail2ban
 - Generates ED25519 SSH key pair
 
+Non-interactive mode:
+```bash
+curl -sSL https://raw.githubusercontent.com/joshuaromkes/crusty-system/main/scripts/ubuntu/ssh-hardener.sh | sudo bash -s -- \
+  --port 58432 --key "$(cat ~/.ssh/id_ed25519.pub)" --no-fail2ban --no-auto-updates
+```
+
 ---
 
-### Auto Update
+#### Auto Update
 
 **What it does:**
 - Prompts for preferred update time (24H format)
 - Creates weekly cron job for system updates
-- Automatically restarts the after updates are applied
+- Automatically restarts after updates are applied
 - Optionally runs updates immediately after setup
 
-**Usage Examples:**
-
-If the script is **not downloaded locally**, use curl with arguments:
 ```bash
-# Install with interactive time selection
+# Install
 curl -sSL https://raw.githubusercontent.com/joshuaromkes/crusty-system/main/scripts/ubuntu/auto-update.sh | sudo bash
 
-# Check current configuration
+# Check status
 curl -sSL https://raw.githubusercontent.com/joshuaromkes/crusty-system/main/scripts/ubuntu/auto-update.sh | sudo bash -s -- status
 
-# Uninstall and clean up
+# Uninstall
 curl -sSL https://raw.githubusercontent.com/joshuaromkes/crusty-system/main/scripts/ubuntu/auto-update.sh | sudo bash -s -- uninstall
-```
-
-If the script is **downloaded locally**:
-```bash
-# Install with interactive time selection
-sudo ./auto-update.sh install
-
-# Run updates immediately
-sudo ./auto-update.sh run-now
-
-# Check current configuration
-sudo ./auto-update.sh status
-
-# Uninstall and clean up
-sudo ./auto-update.sh uninstall
 ```
 
 ---
 
-### Docker Setup
+#### Docker Setup
 
 One-line installation:
 ```bash
 curl -sSL https://raw.githubusercontent.com/joshuaromkes/crusty-system/main/scripts/ubuntu/docker-setup.sh | sudo bash
 ```
+
+---
+
+### Alpine Linux
+
+Full system setup — installs common packages, configures SSH hardening,
+UFW firewall, fail2ban, and automatic daily updates.
+
+One-liner:
+```bash
+curl -sSL https://raw.githubusercontent.com/joshuaromkes/crusty-system/main/scripts/alpine/setup.sh | sh
+```
+
+Or download first:
+```bash
+wget https://raw.githubusercontent.com/joshuaromkes/crusty-system/main/scripts/alpine/setup.sh
+doas sh setup.sh
+```
+
+The script walks you through:
+1. **Additional packages** — choose from nano, bash, curl, htop, tmux, git, rsyslog, chrony, neofetch
+2. **SSH server** — install OpenSSH, configure port, add your public key, apply hardening
+3. **UFW firewall** — deny incoming, allow SSH, enable at boot
+4. **Fail2ban** — escalating bans for brute force protection
+5. **Automatic updates** — daily `apk update && apk upgrade` + reboot
+
+**Note:** Alpine uses `doas` by default (not `sudo`). The script detects which is available.
+
 ---
 
 ## Requirements
 
-- Root or sudo privileges
+- Root or doas/sudo privileges
 - Internet connection for package installation
 
 ## Security Notice
