@@ -1,5 +1,7 @@
 # Crusty System
 
+> **Note:** This codebase was developed with AI assistance. Review and test thoroughly before deploying in production environments.
+
 > Automated configuration and hardening scripts for Linux.
 
 ## Overview
@@ -35,7 +37,7 @@ curl -sSL https://raw.githubusercontent.com/joshuaromkes/crusty-system/main/setu
 
 **Flags:**
 ```
---ssh-key "KEY"        SSH public key (REQUIRED)
+--ssh-key "KEY"        SSH public key for authorized_keys (required unless running interactively — will prompt)
 --ssh-port PORT        SSH port (default: 58432)
 --docker               Install Docker Engine + Compose
 --docker-user USER     Add USER to docker group
@@ -153,6 +155,27 @@ These scripts are designed to enhance server security. However, security is an o
 2. Monitor logs for suspicious activity
 3. Review and rotate certificates periodically
 4. Follow the principle of least privilege for user access
+
+## Contributing
+
+### Reporting Issues
+
+Found a bug or have a feature request? Open an issue on GitHub:
+https://github.com/joshuaromkes/crusty-system/issues
+
+When reporting bugs, include:
+- Which script you were running
+- Operating system and version (`cat /etc/os-release`)
+- Complete error output
+- Steps to reproduce
+
+### Pull Requests
+
+Pull requests are welcome. Please:
+1. Test your changes on a fresh Debian/Ubuntu VM
+2. Run `bash -n` on all modified scripts
+3. Keep the idempotent/safe-first design philosophy
+4. Follow existing code style (color-coded output, `set -euo pipefail`, clear comments)
 
 ## License
 
