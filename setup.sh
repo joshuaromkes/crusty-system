@@ -283,6 +283,13 @@ configure_self_update() {
         return 0
     fi
 
+    # Ensure cron is installed
+    if ! command -v crontab &>/dev/null; then
+        log "Installing cron..."
+        apt-get install -y -qq cron
+        systemctl enable --now cron
+    fi
+
     log "Installing self-update cron job..."
     cat > "$SELF_UPDATE_CRON" << 'EOF'
 # Crusty System — Self-update (weekly Sunday 01:00)

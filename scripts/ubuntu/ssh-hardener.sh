@@ -7,9 +7,6 @@
 
 set -euo pipefail
 
-# Debug trap — logs exact error location
-trap 'log_error "EXIT ON ERROR at line $LINENO in ${FUNCNAME[0]:-main}: $BASH_COMMAND"' ERR
-
 # Colors for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -670,12 +667,10 @@ configure_fail2ban() {
     fi
 
     log "Configuring Fail2ban..."
-    log "DEBUG: checking auth log path..."
 
     # Detect the correct auth log path (Debian/Ubuntu)
     local auth_log="/var/log/auth.log"
     [[ -f "$auth_log" ]] || auth_log="/var/log/secure"
-    log "DEBUG: hashing old jail.local..."
 
     if [[ -f /etc/fail2ban/jail.local ]]; then
         old_hash=$(md5sum /etc/fail2ban/jail.local | cut -d" " -f1)
@@ -750,6 +745,13 @@ configure_auto_updates() {
     log "Configuring automatic updates..."
 
     apt-get install -y -qq unattended-upgrades
+
+    # Ensure cron is installed
+    if ! command -v crontab &>/dev/null; then
+        log "Installing cron..."
+        apt-get install -y -qq cron
+        systemctl enable --now cron
+    fi
 
     cat > /etc/apt/apt.conf.d/20auto-upgrades << EOF
 APT::Periodic::Update-Package-Lists "1";

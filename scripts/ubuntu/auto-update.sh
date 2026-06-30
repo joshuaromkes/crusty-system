@@ -243,6 +243,13 @@ install_auto_updates() {
 
     log "Starting Auto Update Setup..."
 
+    # Ensure cron is installed
+    if ! command -v crontab &>/dev/null; then
+        log "Installing cron..."
+        apt-get install -y -qq cron
+        systemctl enable --now cron
+    fi
+
     if [[ "$NON_INTERACTIVE" != true ]]; then
         prompt_update_time
     fi
