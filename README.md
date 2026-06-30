@@ -29,6 +29,15 @@ curl -sSL https://raw.githubusercontent.com/joshuaromkes/crusty-system/main/setu
   --docker --docker-user $USER
 ```
 
+> **Tip:** When piping via `curl`, stdin is not a terminal, so you MUST pass `--ssh-key`. If you run the script directly on the machine (not piped), it will prompt you interactively.
+
+To use your existing SSH key:
+```bash
+curl -sSL https://raw.githubusercontent.com/joshuaromkes/crusty-system/main/setup.sh | sudo bash -s -- \
+  --ssh-key "$(cat ~/.ssh/id_ed25519.pub)" \
+  --docker --docker-user $USER
+```
+
 **What it does:**
 1. **SSH Hardening** — Changes SSH port, disables password auth, adds your public key, configures UFW firewall, installs fail2ban
 2. **Docker** — Installs Docker Engine from official repo + Compose plugin + hardened daemon (log rotation, no-new-privileges, live-restore)
