@@ -23,6 +23,7 @@ UPDATE_MINUTE="00"
 USER_PUBLIC_KEY=""
 ALLOW_TCP_FORWARDING="no"      # "no" | "local" | "yes"
 DRY_RUN=false
+SKIP_UFW=false
 NON_INTERACTIVE=false
 CURRENT_USER="${SUDO_USER:-${USER:-root}}"
 BACKUP_DIR="/root/crusty-backups-$(date +%Y%m%d_%H%M%S)"
@@ -210,6 +211,13 @@ check_existing_ufw() {
             log_warn "UFW is already active with $rule_count existing rule(s)"
 
             if [[ "$NON_INTERACTIVE" == true ]]; then
+                # Check if existing rules already match what we want
+                if ufw status 2>/dev/null | grep -qE "($SSH_PORT/tcp.*(ALLOW|LIMIT)|(ALLOW|LIMIT).*$SSH_PORT/tcp)"; then
+                    log_info "UFW already configured correctly with port $SSH_PORT — skipping firewall setup"
+                    SKIP_UFW=true
+                    return 0
+                fi
+
                 log_error "UFW has existing rules but running in non-interactive mode."
                 log_error "Use --dry-run first to review, or clear UFW rules before running."
                 log_error "Refusing to reset UFW without confirmation."
@@ -637,6 +645,11 @@ EOF
 }
 
 configure_firewall() {
+    if [[ "$SKIP_UFW" == true ]]; then
+        log_info "UFW already configured — skipping"
+        return 0
+    fi
+
     if [[ "$DRY_RUN" == true ]]; then
         log_info "[DRY RUN] Would reset UFW, allow port $SSH_PORT/tcp, and enable firewall"
         return 0
