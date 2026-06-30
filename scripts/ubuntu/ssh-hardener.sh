@@ -7,6 +7,9 @@
 
 set -euo pipefail
 
+# Debug trap — logs exact error location
+trap 'log_error "EXIT ON ERROR at line $LINENO in ${FUNCNAME[0]:-main}: $BASH_COMMAND"' ERR
+
 # Colors for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -667,16 +670,19 @@ configure_fail2ban() {
     fi
 
     log "Configuring Fail2ban..."
+    log "DEBUG: checking auth log path..."
 
     # Detect the correct auth log path (Debian/Ubuntu)
     local auth_log="/var/log/auth.log"
     [[ -f "$auth_log" ]] || auth_log="/var/log/secure"
+    log "DEBUG: hashing old jail.local..."
 
     if [[ -f /etc/fail2ban/jail.local ]]; then
         old_hash=$(md5sum /etc/fail2ban/jail.local | cut -d" " -f1)
     else
         old_hash=""
     fi
+    log "DEBUG: writing new jail.local..."
 
     cat > /etc/fail2ban/jail.local << EOF
 [DEFAULT]
@@ -709,18 +715,21 @@ maxretry = 3
 bantime = 3600
 findtime = 600
 EOF
+    log "DEBUG: new config written, hashing..."
 
     if [[ -f /etc/fail2ban/jail.local ]]; then
         new_hash=$(md5sum /etc/fail2ban/jail.local | cut -d" " -f1)
     else
         new_hash=""
     fi
+    log "DEBUG: comparing hashes..."
 
     if [[ "$old_hash" == "$new_hash" ]]; then
         log_info "fail2ban jail.local unchanged — skipping restart"
         return 0
     fi
 
+    log "DEBUG: config changed, enabling fail2ban service..."
     systemctl enable fail2ban
     FAIL2BAN_CHANGED=true
 
