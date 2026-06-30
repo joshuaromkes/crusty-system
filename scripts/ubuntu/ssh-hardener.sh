@@ -654,6 +654,8 @@ configure_firewall() {
 }
 
 configure_fail2ban() {
+    FAIL2BAN_CHANGED=false
+
     if [[ "$USE_FAIL2BAN" != true ]]; then
         log "Skipping fail2ban configuration (user opted out)"
         return 0
@@ -712,6 +714,7 @@ EOF
     fi
 
     systemctl enable fail2ban
+    FAIL2BAN_CHANGED=true
 
     log "Fail2ban configured (escalating bans on port $SSH_PORT)"
 }
@@ -967,7 +970,7 @@ printf "${YELLOW}Log File:${NC}\n"
 echo "  $LOG_FILE"
 echo ""
 
-if [[ "$USE_FAIL2BAN" == true ]] && [[ "$DRY_RUN" != true ]]; then
+if [[ "$FAIL2BAN_CHANGED" == true ]]; then
     log "Applying fail2ban with reload-or-restart..."
     systemctl reload-or-restart fail2ban
 fi
