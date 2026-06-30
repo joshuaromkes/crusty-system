@@ -103,7 +103,7 @@ create_cron_job() {
     cat > "$CRON_FILE" << EOF
 # Crusty System - Weekly automatic updates at ${UPDATE_HOUR}:${UPDATE_MINUTE}
 SHELL=/bin/bash
-${UPDATE_MINUTE} ${UPDATE_HOUR} * * 0 root /usr/bin/apt-get update -qq && /usr/bin/apt-get upgrade -y -qq && if [ -f /var/run/reboot-required ]; then /usr/sbin/shutdown -r +5 "Crusty System: reboot required after updates"; fi
+${UPDATE_MINUTE} ${UPDATE_HOUR} * * 0 root /usr/bin/apt update -qq && /usr/bin/apt full-upgrade -y -qq && /usr/bin/apt autoremove --purge -y -qq && /usr/bin/apt autoclean && if [ -f /var/run/reboot-required ]; then /usr/sbin/shutdown -r +5 "Crusty System: reboot required after updates"; fi
 EOF
     chmod 644 "$CRON_FILE"
     log "Cron job created at $CRON_FILE"
@@ -114,20 +114,30 @@ run_updates_now() {
     log "Starting immediate system update..."
     echo ""
 
-    log "Running: apt-get update"
-    if ! apt-get update -qq; then
+    log "Running: apt update"
+    if ! apt update -qq; then
         log_error "Failed to update package list"
         return 1
     fi
     log "Package list updated successfully"
 
     echo ""
-    log "Running: apt-get upgrade -y"
-    if ! apt-get upgrade -y -qq; then
+    log "Running: apt full-upgrade -y"
+    if ! apt full-upgrade -y -qq; then
         log_error "Failed to upgrade packages"
         return 1
     fi
     log "System packages upgraded successfully"
+
+    echo ""
+    log "Running: apt autoremove --purge -y"
+    apt autoremove --purge -y -qq
+    log "Orphaned packages removed"
+
+    echo ""
+    log "Running: apt autoclean"
+    apt autoclean
+    log "Package cache cleaned"
 
     echo ""
     if [[ -f /var/run/reboot-required ]]; then
@@ -272,7 +282,7 @@ install_auto_updates() {
 
     echo ""
     printf "${GREEN}To manually trigger an update later, run:${NC}\n"
-    echo "  sudo apt-get update && sudo apt-get upgrade -y"
+    echo "  sudo apt update && sudo apt full-upgrade -y && sudo apt autoremove --purge -y && sudo apt autoclean"
     echo ""
 }
 

@@ -786,7 +786,7 @@ EOF
     cat > /etc/cron.d/crusty-auto-update << EOF
 # Crusty System - Weekly automatic updates at ${UPDATE_HOUR}:${UPDATE_MINUTE}
 SHELL=/bin/bash
-${UPDATE_MINUTE} ${UPDATE_HOUR} * * 0 root /usr/bin/apt-get update -qq && /usr/bin/apt-get upgrade -y -qq && if [ -f /var/run/reboot-required ]; then /usr/sbin/shutdown -r +5 "Crusty System: reboot required after updates"; fi
+${UPDATE_MINUTE} ${UPDATE_HOUR} * * 0 root /usr/bin/apt update -qq && /usr/bin/apt full-upgrade -y -qq && /usr/bin/apt autoremove --purge -y -qq && /usr/bin/apt autoclean && if [ -f /var/run/reboot-required ]; then /usr/sbin/shutdown -r +5 "Crusty System: reboot required after updates"; fi
 EOF
     chmod 644 /etc/cron.d/crusty-auto-update
 
