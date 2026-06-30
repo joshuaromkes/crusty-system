@@ -234,6 +234,12 @@ parse_args() {
 }
 
 install_auto_updates() {
+    if [[ -f "$CRON_FILE" ]]; then
+        log_info "Auto-update cron already configured at $CRON_FILE"
+        show_config
+        return 0
+    fi
+
     log "Starting Auto Update Setup..."
 
     if [[ "$NON_INTERACTIVE" != true ]]; then

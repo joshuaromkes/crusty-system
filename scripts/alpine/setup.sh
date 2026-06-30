@@ -364,10 +364,14 @@ setup_sshd() {
     fi
 
     log "Installing OpenSSH server..."
-    apk add openssh || {
-        log_error "Failed to install openssh"
-        exit 1
-    }
+    if ! apk info -e openssh >/dev/null 2>&1; then
+        apk add openssh || {
+            log_error "Failed to install openssh"
+            exit 1
+        }
+    else
+        log_info "openssh already installed"
+    fi
 
     # Get the user's home directory
     if [ -n "${SUDO_USER:-}" ]; then
@@ -482,11 +486,15 @@ setup_ufw() {
     fi
 
     log "Installing UFW firewall..."
-    apk add ip6tables ufw || {
-        log_error "Failed to install ufw"
-        log_error "Make sure the community repository is enabled in /etc/apk/repositories"
-        exit 1
-    }
+    if ! apk info -e ufw >/dev/null 2>&1; then
+        apk add ip6tables ufw || {
+            log_error "Failed to install ufw"
+            log_error "Make sure the community repository is enabled in /etc/apk/repositories"
+            exit 1
+        }
+    else
+        log_info "ufw already installed"
+    fi
 
     # Backup existing iptables rules
     if [ -d /etc/ufw ]; then
@@ -520,10 +528,14 @@ setup_fail2ban() {
     fi
 
     log "Installing fail2ban..."
-    apk add fail2ban fail2ban-openrc || {
-        log_error "Failed to install fail2ban"
-        exit 1
-    }
+    if ! apk info -e fail2ban >/dev/null 2>&1; then
+        apk add fail2ban fail2ban-openrc || {
+            log_error "Failed to install fail2ban"
+            exit 1
+        }
+    else
+        log_info "fail2ban already installed"
+    fi
 
     # Detect auth log location (Alpine uses /var/log/messages by default,
     # but /var/log/auth.log if rsyslog is installed)
@@ -572,7 +584,11 @@ setup_auto_updates() {
     log "Configuring automatic updates..."
 
     # Ensure crond is installed and running
-    apk add cronie >/dev/null 2>&1 || apk add dcron >/dev/null 2>&1 || true
+    if ! apk info -e cronie >/dev/null 2>&1 && ! apk info -e dcron >/dev/null 2>&1; then
+        apk add cronie >/dev/null 2>&1 || apk add dcron >/dev/null 2>&1 || true
+    else
+        log_info "cron daemon already installed"
+    fi
 
     # Add cron job to root's crontab
     _cron_entry="${UPDATE_MINUTE} ${UPDATE_HOUR} * * * /sbin/apk update && /sbin/apk upgrade --available && /sbin/reboot"

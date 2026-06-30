@@ -139,17 +139,28 @@ configure_daemon() {
 DAEMON_EOF
 )
 
-    local current="{}"
-    if [[ -f "$DAEMON_JSON" ]]; then
-        current="$(cat "$DAEMON_JSON")"
+    if [[ ! -f "$DAEMON_JSON" ]]; then
+        log "Creating Docker daemon configuration with security best practices..."
+        echo "$desired" > "$DAEMON_JSON"
+        systemctl restart docker
+        log "Docker daemon configured and restarted"
+        return 0
     fi
 
-    if [[ "$current" == "$desired" ]]; then
+    local missing=false
+    for key in "no-new-privileges" "live-restore" "log-driver" "userland-proxy"; do
+        if ! grep -q "\"$key\"" "$DAEMON_JSON"; then
+            missing=true
+            break
+        fi
+    done
+
+    if [[ "$missing" == false ]]; then
         log_info "Docker daemon already configured with security settings"
         return 0
     fi
 
-    log "Configuring Docker daemon with security best practices..."
+    log_warn "daemon.json exists but missing some security keys — overwriting"
     echo "$desired" > "$DAEMON_JSON"
 
     systemctl restart docker
