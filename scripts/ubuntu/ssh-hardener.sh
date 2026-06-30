@@ -897,6 +897,23 @@ fi
 setup_authorized_keys
 configure_firewall
 apply_ssh_config
+
+    # Completion banner — print BEFORE fail2ban in case it drops the connection
+    PRIMARY_IP=$(get_primary_ip)
+    echo ""
+    echo "=========================================="
+    printf "${GREEN}[%s]${NC} SSH Hardening Complete!\n" "$(date +'%Y-%m-%d %H:%M:%S')"
+    echo "=========================================="
+    echo ""
+    printf "${GREEN}SSH Port:${NC} %s\n" "$SSH_PORT"
+    printf "${GREEN}User:${NC} %s\n" "$CURRENT_USER"
+    printf "${GREEN}IP:${NC} %s\n" "$PRIMARY_IP"
+    echo ""
+    printf "${YELLOW}Connect:${NC} ssh -p %s %s@%s\n" "$SSH_PORT" "$CURRENT_USER" "$PRIMARY_IP"
+    echo ""
+    echo "Now configuring fail2ban and auto-updates..."
+    echo ""
+
 configure_fail2ban
 configure_auto_updates
 
