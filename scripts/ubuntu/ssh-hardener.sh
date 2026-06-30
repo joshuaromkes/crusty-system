@@ -618,27 +618,13 @@ EOF
         return 0
     fi
 
-    # Restart SSH — detect the correct service name
-    local ssh_service=""
-    if systemctl list-units --type=service --all 2>/dev/null | grep -q "sshd.service"; then
-        ssh_service="sshd"
-    elif systemctl list-units --type=service --all 2>/dev/null | grep -q "ssh.service"; then
-        ssh_service="ssh"
+    # Restart SSH — try ssh first (Debian default), then sshd
+    if systemctl restart ssh 2>/dev/null; then
+        log "SSH service restarted (ssh.service)"
+    elif systemctl restart sshd 2>/dev/null; then
+        log "SSH service restarted (sshd.service)"
     else
-        log_error "Cannot find SSH service (tried sshd.service and ssh.service)"
-        exit 1
-    fi
-
-    log "Restarting SSH service ($ssh_service)..."
-    if systemctl restart "$ssh_service"; then
-        log "SSH service restarted successfully"
-    else
-        log_error "Failed to restart SSH service!"
-        echo "Restoring backup configuration..."
-        cp "$BACKUP_DIR/sshd_config.backup" /etc/ssh/sshd_config
-        systemctl restart "$ssh_service" || true
-        echo "Backup restored. Please check the configuration and try again."
-        exit 1
+        log_error "Cannot restart SSH service (tried ssh and sshd)"
     fi
 
     log "SSH configuration applied on port $SSH_PORT"
