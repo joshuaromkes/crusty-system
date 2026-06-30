@@ -784,9 +784,11 @@ EOF
         return 0
     fi
     cat > /etc/cron.d/crusty-auto-update << EOF
-# Crusty System - Weekly automatic updates at ${UPDATE_HOUR}:${UPDATE_MINUTE}
+# Crusty System - Combined weekly maintenance job (script download + apt updates + conditional reboot)
+# Runs weekly on Sunday at ${UPDATE_HOUR}:${UPDATE_MINUTE}
+# Downloads latest scripts, then runs apt update, full-upgrade, autoremove, autoclean, and reboots if needed
 SHELL=/bin/bash
-${UPDATE_MINUTE} ${UPDATE_HOUR} * * 0 root /usr/bin/apt update -qq && /usr/bin/apt full-upgrade -y -qq && /usr/bin/apt autoremove --purge -y -qq && /usr/bin/apt autoclean && if [ -f /var/run/reboot-required ]; then /usr/sbin/shutdown -r +5 "Crusty System: reboot required after updates"; fi
+${UPDATE_MINUTE} ${UPDATE_HOUR} * * 0 root mkdir -p /opt/crusty-system && curl -fsSL "https://raw.githubusercontent.com/joshuaromkes/crusty-system/main/setup.sh" -o /opt/crusty-system/setup.sh && curl -fsSL "https://raw.githubusercontent.com/joshuaromkes/crusty-system/main/scripts/ubuntu/ssh-hardener.sh" -o /opt/crusty-system/scripts/ubuntu/ssh-hardener.sh && curl -fsSL "https://raw.githubusercontent.com/joshuaromkes/crusty-system/main/scripts/ubuntu/docker-setup.sh" -o /opt/crusty-system/scripts/ubuntu/docker-setup.sh && curl -fsSL "https://raw.githubusercontent.com/joshuaromkes/crusty-system/main/scripts/ubuntu/auto-update.sh" -o /opt/crusty-system/scripts/ubuntu/auto-update.sh && /usr/bin/apt update -qq && /usr/bin/apt full-upgrade -y -qq && /usr/bin/apt autoremove --purge -y -qq && /usr/bin/apt autoclean && if [ -f /var/run/reboot-required ]; then /usr/sbin/shutdown -r +5 "Crusty System: reboot required after updates"; fi
 EOF
     chmod 644 /etc/cron.d/crusty-auto-update
 

@@ -62,7 +62,7 @@ WHAT THIS DOES:
   2. Docker          — Installs Docker Engine from official repo, Compose plugin,
                        hardened daemon config (if --docker)
   3. Auto Updates    — Unattended weekly upgrades with conditional reboot
-  4. Self-Update     — Weekly cron to auto-update crusty-system scripts
+   4. Self-Update     — Script auto-update merged into weekly auto-update cron
 
 EXAMPLES:
   # Full setup with Docker
@@ -273,31 +273,10 @@ download_script() {
 }
 
 configure_self_update() {
-    if [[ "$DRY_RUN" == true ]]; then
-        log_info "[DRY RUN] Would install self-update cron at $SELF_UPDATE_CRON"
-        return 0
-    fi
-
     if [[ -f "$SELF_UPDATE_CRON" ]]; then
-        log_info "Self-update cron already configured"
-        return 0
+        log_info "Removing legacy self-update cron (now merged into auto-update)..."
+        rm -f "$SELF_UPDATE_CRON"
     fi
-
-    # Ensure cron is installed
-    if ! command -v crontab &>/dev/null; then
-        log "Installing cron..."
-        apt-get install -y -qq cron
-        systemctl enable --now cron
-    fi
-
-    log "Installing self-update cron job..."
-    cat > "$SELF_UPDATE_CRON" << 'EOF'
-# Crusty System — Self-update (weekly Sunday 01:00)
-SHELL=/bin/bash
-0 1 * * 0 root mkdir -p /opt/crusty-system && cd /opt/crusty-system && curl -fsSL "https://raw.githubusercontent.com/joshuaromkes/crusty-system/main/setup.sh" -o /opt/crusty-system/setup.sh && chmod +x /opt/crusty-system/setup.sh && curl -fsSL "https://raw.githubusercontent.com/joshuaromkes/crusty-system/main/scripts/ubuntu/ssh-hardener.sh" -o /opt/crusty-system/scripts/ubuntu/ssh-hardener.sh && curl -fsSL "https://raw.githubusercontent.com/joshuaromkes/crusty-system/main/scripts/ubuntu/docker-setup.sh" -o /opt/crusty-system/scripts/ubuntu/docker-setup.sh && curl -fsSL "https://raw.githubusercontent.com/joshuaromkes/crusty-system/main/scripts/ubuntu/auto-update.sh" -o /opt/crusty-system/scripts/ubuntu/auto-update.sh 2>&1 | logger -t crusty-self-update
-EOF
-    chmod 644 "$SELF_UPDATE_CRON"
-    log "Self-update cron installed (weekly Sunday 01:00)"
 }
 
 print_banner() {
@@ -325,7 +304,6 @@ print_summary() {
     if [[ -n "$DOCKER_USER" ]]; then
         echo "  - Docker User:         $DOCKER_USER"
     fi
-    echo "  - Self-Update Cron:    Installed (weekly Sunday 01:00)"
     echo ""
     printf "${YELLOW}SSH Connection:${NC}\n"
     echo "  ssh -p $SSH_PORT $(whoami)@<server-ip>"
@@ -348,7 +326,6 @@ main() {
         log_info "  Docker user: ${DOCKER_USER:-none}"
         log_info "  Fail2ban: $([[ "$NO_FAIL2BAN" == false ]] && echo 'yes' || echo 'no')"
         log_info "  Auto updates: $([[ "$NO_AUTO_UPDATES" == false ]] && echo "yes ($UPDATE_TIME)" || echo 'no')"
-        log_info "  Self-update: yes"
         log_info "Dry run complete."
         exit 0
     fi
