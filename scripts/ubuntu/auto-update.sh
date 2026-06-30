@@ -4,234 +4,282 @@
 # Configures automatic weekly system updates
 #
 
-set -e
+set -euo pipefail
 
-# Colors for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
-NC='\033[0m' # No Color
+BLUE='\033[0;34m'
+NC='\033[0m'
 
 CRON_FILE="/etc/cron.d/crusty-auto-update"
+UPDATE_HOUR="02"
+UPDATE_MINUTE="00"
+NON_INTERACTIVE=false
 
-# Check if running as root
+usage() {
+    cat << EOF
+Usage: $0 [OPTION]
+
+Configure automatic weekly system updates for Debian/Ubuntu.
+
+OPTIONS:
+  install            Install and configure auto-updates (default)
+  uninstall          Remove auto-update configuration and files
+  status             Show current auto-update configuration
+  run-now            Trigger system updates immediately
+  --help, -h         Show this help
+
+NON-INTERACTIVE FLAGS (used with 'install'):
+  --non-interactive   Skip all prompts (requires --time)
+  --time HH:MM        Update time in 24H format (default: 02:00)
+
+Examples:
+  sudo $0 install
+  sudo $0 install --non-interactive --time 03:30
+  sudo $0 uninstall
+  sudo $0 run-now
+EOF
+    exit 0
+}
+
+log()    { printf "${GREEN}[%s]${NC} %s\n" "$(date +'%Y-%m-%d %H:%M:%S')" "$1"; }
+log_warn() { printf "${YELLOW}[%s] WARNING:${NC} %s\n" "$(date +'%Y-%m-%d %H:%M:%S')" "$1"; }
+log_error() { printf "${RED}[%s] ERROR:${NC} %s\n" "$(date +'%Y-%m-%d %H:%M:%S')" "$1"; }
+
 check_root() {
     if [[ $EUID -ne 0 ]]; then
-        echo -e "${RED}ERROR: This script must be run as root${NC}"
+        log_error "This script must be run as root"
         exit 1
     fi
 }
 
-# Function to prompt user for update time with input validation
-prompt_update_time() {
-    local hour
-    local minute
-    local valid=false
+validate_time() {
+    local time_str="$1"
+    local hour minute
+    if [[ ! "$time_str" =~ ^([0-9]{1,2}):([0-9]{2})$ ]]; then
+        return 1
+    fi
+    hour=$((10#${BASH_REMATCH[1]}))
+    minute=$((10#${BASH_REMATCH[2]}))
+    if [[ "$hour" -lt 0 || "$hour" -gt 23 ]]; then
+        return 1
+    fi
+    if [[ "$minute" -lt 0 || "$minute" -gt 59 ]]; then
+        return 1
+    fi
+    printf -v UPDATE_HOUR "%02d" "$hour"
+    printf -v UPDATE_MINUTE "%02d" "$minute"
+    return 0
+}
 
+prompt_update_time() {
+    local hour minute valid=false
     echo ""
-    echo -e "${YELLOW}=== Automatic Update Schedule Configuration ===${NC}"
+    printf "${YELLOW}=== Automatic Update Schedule Configuration ===${NC}\n"
     echo ""
     echo "Please specify when you'd like automatic updates to run."
     echo "Enter time in 24-hour format (HH:MM), e.g., 02:00 for 2:00 AM"
     echo ""
 
     while [[ "$valid" == false ]]; do
-        read -rp "Enter update time (HH:MM): " time_input < /dev/tty
+        read -rp "Enter update time (HH:MM) [default: 02:00]: " time_input < /dev/tty
+        time_input=${time_input:-02:00}
 
-        # Check if input matches HH:MM format
-        if [[ "$time_input" =~ ^([0-9]{1,2}):([0-9]{2})$ ]]; then
-            hour="${BASH_REMATCH[1]}"
-            minute="${BASH_REMATCH[2]}"
-
-            # Validate hour (0-23)
-            if [[ "$hour" -ge 0 && "$hour" -le 23 ]]; then
-                # Validate minute (0-59)
-                if [[ "$minute" -ge 0 && "$minute" -le 59 ]]; then
-                    valid=true
-                else
-                    echo -e "${RED}ERROR: Invalid minutes. Please enter a value between 00 and 59.${NC}"
-                fi
-            else
-                echo -e "${RED}ERROR: Invalid hour. Please enter a value between 00 and 23.${NC}"
-            fi
+        if validate_time "$time_input"; then
+            valid=true
         else
-            echo -e "${RED}ERROR: Invalid format. Please use HH:MM format (e.g., 02:00, 14:30)${NC}"
+            printf "${RED}ERROR: Invalid format. Use HH:MM (e.g., 02:00, 14:30)${NC}\n"
         fi
     done
 
-    # Format with leading zeros
-    printf -v UPDATE_HOUR "%02d" "$hour"
-    printf -v UPDATE_MINUTE "%02d" "$minute"
-
     echo ""
-    echo -e "${GREEN}Update time set to: ${UPDATE_HOUR}:${UPDATE_MINUTE}${NC}"
+    printf "${GREEN}Update time set to: ${UPDATE_HOUR}:${UPDATE_MINUTE}${NC}\n"
 }
 
-# Function to create cron job
 create_cron_job() {
-    echo -e "${GREEN}Creating weekly update cron job for ${UPDATE_HOUR}:${UPDATE_MINUTE}...${NC}"
+    log "Creating weekly update cron job for ${UPDATE_HOUR}:${UPDATE_MINUTE}..."
     cat > "$CRON_FILE" << EOF
 # Crusty System - Weekly automatic updates at ${UPDATE_HOUR}:${UPDATE_MINUTE}
-${UPDATE_MINUTE} ${UPDATE_HOUR} * * 0 root /usr/bin/apt-get update && /usr/bin/apt-get upgrade -y && sudo shutdown -r now
+SHELL=/bin/bash
+${UPDATE_MINUTE} ${UPDATE_HOUR} * * 0 root /usr/bin/apt-get update -qq && /usr/bin/apt-get upgrade -y -qq && if [ -f /var/run/reboot-required ]; then /usr/sbin/shutdown -r +5 "Crusty System: reboot required after updates"; fi
 EOF
     chmod 644 "$CRON_FILE"
+    log "Cron job created at $CRON_FILE"
 }
 
-# Function to run updates immediately
 run_updates_now() {
     echo ""
-    echo -e "${GREEN}Starting immediate system update...${NC}"
+    log "Starting immediate system update..."
     echo ""
 
-    echo -e "${YELLOW}Running: apt-get update${NC}"
-    if apt-get update; then
-        echo -e "${GREEN}Package list updated successfully.${NC}"
-    else
-        echo -e "${RED}ERROR: Failed to update package list.${NC}"
+    log "Running: apt-get update"
+    if ! apt-get update -qq; then
+        log_error "Failed to update package list"
         return 1
+    fi
+    log "Package list updated successfully"
+
+    echo ""
+    log "Running: apt-get upgrade -y"
+    if ! apt-get upgrade -y -qq; then
+        log_error "Failed to upgrade packages"
+        return 1
+    fi
+    log "System packages upgraded successfully"
+
+    echo ""
+    if [[ -f /var/run/reboot-required ]]; then
+        log_warn "Reboot required after updates"
+        if [[ "$NON_INTERACTIVE" == true ]]; then
+            log "Non-interactive mode: scheduling reboot in 5 minutes"
+            shutdown -r +5 "Crusty System: reboot required after updates"
+        else
+            local response
+            read -rp "Reboot required. Reboot now? [y/N]: " response < /dev/tty
+            if [[ "$response" =~ ^[Yy]$ ]]; then
+                shutdown -r +1 "Crusty System: reboot required after updates"
+                log "Reboot scheduled in 1 minute"
+            else
+                log "Reboot skipped — please reboot manually when ready"
+            fi
+        fi
     fi
 
     echo ""
-    echo -e "${YELLOW}Running: apt-get upgrade -y${NC}"
-    if apt-get upgrade -y; then
-        echo -e "${GREEN}System packages upgraded successfully.${NC}"
-    else
-        echo -e "${RED}ERROR: Failed to upgrade packages.${NC}"
-        return 1
-    fi
-
-    echo ""
-    echo -e "${GREEN}Update completed.${NC}"
+    log "Update completed"
 }
 
-# Function to prompt for immediate update
 prompt_run_now() {
     echo ""
-    echo -e "${YELLOW}=== Run Updates Now ===${NC}"
+    printf "${YELLOW}=== Run Updates Now ===${NC}\n"
     echo ""
     read -rp "Would you like to run system updates now? [y/N]: " run_now < /dev/tty
 
     if [[ "$run_now" =~ ^[Yy]$ ]]; then
         run_updates_now
     else
-        echo -e "${GREEN}Skipping immediate update.${NC}"
+        printf "${GREEN}Skipping immediate update.${NC}\n"
     fi
 }
 
-# Function to uninstall auto-updates
 uninstall_auto_updates() {
-    echo -e "${GREEN}Starting uninstallation of auto-update configuration...${NC}"
+    log "Starting uninstallation of auto-update configuration..."
 
-    # Remove cron job
     if [[ -f "$CRON_FILE" ]]; then
-        echo -e "${GREEN}Removing cron job: $CRON_FILE${NC}"
+        log "Removing cron job: $CRON_FILE"
         rm -f "$CRON_FILE"
     else
-        echo -e "${YELLOW}Cron job not found at $CRON_FILE${NC}"
+        log_warn "Cron job not found at $CRON_FILE"
     fi
 
     echo ""
     echo "=========================================="
-    echo -e "${GREEN}Uninstallation Complete!${NC}"
+    log "Uninstallation Complete!"
     echo "=========================================="
     echo ""
-    echo -e "${GREEN}Removed:${NC}"
+    printf "${GREEN}Removed:${NC}\n"
     echo "  - Cron job: $CRON_FILE"
     echo ""
 }
 
-# Function to display current configuration
 show_config() {
     echo ""
     echo "=========================================="
-    echo -e "${GREEN}Current Auto-Update Configuration${NC}"
+    printf "${GREEN}Current Auto-Update Configuration${NC}\n"
     echo "=========================================="
     echo ""
 
     if [[ -f "$CRON_FILE" ]]; then
-        echo -e "${GREEN}Cron Job:${NC}"
+        printf "${GREEN}Cron Job:${NC}\n"
         echo "  Schedule: Weekly on Sunday"
-        grep -v "^#" "$CRON_FILE" | head -1
+        grep -v "^#" "$CRON_FILE" | grep -v "^SHELL=" | head -1
         echo ""
     else
-        echo -e "${YELLOW}No cron job found.${NC}"
+        printf "${YELLOW}No cron job found.${NC}\n"
     fi
     echo ""
 }
 
-# Function to display usage
-show_usage() {
-    echo "Usage: $0 [OPTION]"
-    echo ""
-    echo "Options:"
-    echo "  install     Install and configure auto-updates (default)"
-    echo "  uninstall   Remove auto-update configuration and files"
-    echo "  status      Show current auto-update configuration"
-    echo "  run-now     Trigger system updates immediately"
-    echo "  --help      Show this help message"
-    echo ""
-    echo "Examples:"
-    echo "  sudo $0 install"
-    echo "  sudo $0 uninstall"
-    echo "  sudo $0 run-now"
-    echo ""
+parse_args() {
+    local mode="install"
+    local positional=()
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --non-interactive)
+                NON_INTERACTIVE=true; shift ;;
+            --time)
+                if [[ -z "${2:-}" ]]; then
+                    log_error "--time requires an HH:MM value"
+                    exit 1
+                fi
+                if ! validate_time "$2"; then
+                    log_error "Invalid --time value: $2 (use HH:MM format)"
+                    exit 1
+                fi
+                shift 2 ;;
+            --help|-h)
+                usage ;;
+            install|uninstall|status|run-now)
+                mode="$1"; shift ;;
+            *)
+                log_error "Unknown option: $1"
+                echo "Run with --help for usage."
+                exit 1 ;;
+        esac
+    done
+
+    echo "$mode"
 }
 
-# Main installation function
 install_auto_updates() {
-    echo -e "${GREEN}Starting Auto Update Setup...${NC}"
+    log "Starting Auto Update Setup..."
 
-    # Prompt for update time
-    prompt_update_time
+    if [[ "$NON_INTERACTIVE" != true ]]; then
+        prompt_update_time
+    fi
 
-    # Create cron job
     create_cron_job
 
-    # Display summary
     echo ""
     echo "=========================================="
-    echo -e "${GREEN}Auto Update Setup Complete!${NC}"
+    log "Auto Update Setup Complete!"
     echo "=========================================="
     echo ""
-    echo -e "${GREEN}Configuration Summary:${NC}"
+    printf "${GREEN}Configuration Summary:${NC}\n"
     echo "  - Update Schedule: Weekly at ${UPDATE_HOUR}:${UPDATE_MINUTE} (Sunday)"
-    echo "  - Auto Restart: Enabled (server will restart after updates)"
+    echo "  - Reboot: Conditional (only if /var/run/reboot-required exists, +5 min delay)"
     echo ""
 
-    # Ask if user wants to run updates now
-    prompt_run_now
+    if [[ "$NON_INTERACTIVE" != true ]]; then
+        prompt_run_now
+    fi
 
     echo ""
-    echo -e "${GREEN}To manually trigger an update later, run:${NC}"
+    printf "${GREEN}To manually trigger an update later, run:${NC}\n"
     echo "  sudo apt-get update && sudo apt-get upgrade -y"
     echo ""
 }
 
-# Main script logic
 main() {
     check_root
 
-    case "${1:-install}" in
+    local mode
+    mode=$(parse_args "$@")
+
+    case "$mode" in
         install)
-            install_auto_updates
-            ;;
+            install_auto_updates ;;
         uninstall)
-            uninstall_auto_updates
-            ;;
+            uninstall_auto_updates ;;
         status)
-            show_config
-            ;;
+            show_config ;;
         run-now)
-            run_updates_now
-            ;;
-        --help|-h)
-            show_usage
-            ;;
+            run_updates_now ;;
         *)
-            echo -e "${RED}ERROR: Unknown option: $1${NC}"
-            show_usage
-            exit 1
-            ;;
+            log_error "Unknown mode: $mode"
+            exit 1 ;;
     esac
 }
 
