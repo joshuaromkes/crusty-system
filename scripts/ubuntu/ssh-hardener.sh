@@ -970,10 +970,9 @@ printf "${YELLOW}Log File:${NC}\n"
 echo "  $LOG_FILE"
 echo ""
 
-if [[ "$FAIL2BAN_CHANGED" == true ]]; then
-    log "Applying fail2ban with reload-or-restart..."
-    systemctl reload-or-restart fail2ban
-fi
+# Note: fail2ban config has been written to disk and the service is enabled.
+# Changes will be picked up on next reboot. We skip reload here because
+# restarting fail2ban manipulates iptables chains and can sever SSH sessions.
 
 printf "${RED}==========================================${NC}\n"
 printf "${RED}              IMPORTANT!${NC}\n"
