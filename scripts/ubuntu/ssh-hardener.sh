@@ -672,7 +672,11 @@ configure_fail2ban() {
     local auth_log="/var/log/auth.log"
     [[ -f "$auth_log" ]] || auth_log="/var/log/secure"
 
-    old_hash=$(md5sum /etc/fail2ban/jail.local 2>/dev/null | cut -d" " -f1)
+    if [[ -f /etc/fail2ban/jail.local ]]; then
+        old_hash=$(md5sum /etc/fail2ban/jail.local | cut -d" " -f1)
+    else
+        old_hash=""
+    fi
 
     cat > /etc/fail2ban/jail.local << EOF
 [DEFAULT]
@@ -706,7 +710,11 @@ bantime = 3600
 findtime = 600
 EOF
 
-    new_hash=$(md5sum /etc/fail2ban/jail.local | cut -d" " -f1)
+    if [[ -f /etc/fail2ban/jail.local ]]; then
+        new_hash=$(md5sum /etc/fail2ban/jail.local | cut -d" " -f1)
+    else
+        new_hash=""
+    fi
 
     if [[ "$old_hash" == "$new_hash" ]]; then
         log_info "fail2ban jail.local unchanged — skipping restart"
