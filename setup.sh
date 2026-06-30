@@ -42,8 +42,8 @@ Usage: sudo bash setup.sh [OPTIONS]
 One-liner:
   curl -sSL https://raw.githubusercontent.com/joshuaromkes/crusty-system/main/setup.sh | sudo bash -s -- --ssh-key "ssh-ed25519 AAA..."
 
-REQUIRED:
-  --ssh-key "KEY"       SSH public key for authorized_keys (REQUIRED)
+REQUIRED (when not running interactively):
+  --ssh-key "KEY"       SSH public key for authorized_keys
 
 OPTIONAL:
   --ssh-port PORT        SSH port (1-65535, default: 58432)
@@ -151,11 +151,14 @@ parse_args() {
         esac
     done
 
-    # Validation
+    # SSH key: from CLI arg, interactive prompt, or fail if non-TTY
     if [[ "$DRY_RUN" == false ]] && [[ -z "$SSH_KEY" ]]; then
-        log_error "--ssh-key is required"
-        echo "Usage: $0 --ssh-key \"ssh-ed25519 AAAAC3NzaC...\" [other options]"
-        exit 1
+        if [[ ! -t 0 ]]; then
+            log_error "--ssh-key is required when stdin is not a terminal"
+            echo "Usage: $0 --ssh-key \"ssh-ed25519 AAAAC3NzaC...\" [other options]"
+            exit 1
+        fi
+        prompt_ssh_key
     fi
 
     if [[ ! "$SSH_PORT" =~ ^[0-9]+$ ]] || [[ "$SSH_PORT" -lt 1 ]] || [[ "$SSH_PORT" -gt 65535 ]]; then
@@ -164,6 +167,88 @@ parse_args() {
     fi
 
     validate_time "$UPDATE_TIME"
+}
+
+prompt_ssh_key() {
+    echo ""
+    printf "${YELLOW}==========================================${NC}\n"
+    printf "${YELLOW}    SSH KEY GENERATION INSTRUCTIONS${NC}\n"
+    printf "${YELLOW}==========================================${NC}\n\n"
+    printf "${BLUE}You must generate an SSH key pair on your CLIENT machine${NC}\n"
+    printf "${BLUE}(the computer you will use to connect to this server)${NC}\n\n"
+    echo "The private key stays on your client machine."
+    echo "You will provide the PUBLIC key to this script."
+    echo ""
+    printf "${GREEN}--- Windows (OpenSSH - Windows 10/11) ---${NC}\n"
+    printf "1. Open PowerShell or Command Prompt\n"
+    printf "2. Run: ssh-keygen -t ed25519 -C \"your_email@example.com\"\n"
+    printf "3. Press Enter to accept default location\n"
+    printf "4. Enter a passphrase (recommended) or press Enter for none\n"
+    printf "5. Your public key is at: C:\\Users\\YOUR_USERNAME\\.ssh\\id_ed25519.pub\n\n"
+    printf "${GREEN}--- Windows (PuTTY) ---${NC}\n"
+    printf "1. Download PuTTYgen from: https://www.chiark.greenend.org.uk/~sgtatham/putty/latest.html\n"
+    printf "2. Open PuTTYgen, select 'Ed25519' as the key type\n"
+    printf "3. Click 'Generate' and move your mouse randomly\n"
+    printf "4. Add a passphrase (optional but recommended)\n"
+    printf "5. Save the private key (.ppk file) to your computer\n"
+    printf "6. Copy the public key text from the box at the top\n\n"
+    printf "${GREEN}--- Linux / macOS ---${NC}\n"
+    printf "1. Open a terminal\n"
+    printf "2. Run: ssh-keygen -t ed25519 -C \"your_email@example.com\"\n"
+    printf "3. Press Enter to accept default location (~/.ssh/id_ed25519)\n"
+    printf "4. Enter a passphrase (recommended) or press Enter for none\n"
+    printf "5. Your public key is at: ~/.ssh/id_ed25519.pub\n"
+    printf "6. View it with: cat ~/.ssh/id_ed25519.pub\n\n"
+    printf "${YELLOW}IMPORTANT: Keep your private key secret!${NC}\n"
+    printf "${YELLOW}Only share the PUBLIC key (ends in .pub)${NC}\n\n"
+
+    printf "${YELLOW}==========================================${NC}\n"
+    printf "${YELLOW}    SSH PUBLIC KEY CONFIGURATION${NC}\n"
+    printf "${YELLOW}==========================================${NC}\n\n"
+    echo "Please paste your SSH PUBLIC key below."
+    echo "The key should look like one of these formats:"
+    echo "  ssh-ed25519 AAAAC3NzaC... user@hostname"
+    echo "  sk-ssh-ed25519@openssh.com AAAAGnNr... user@hostname"
+    echo "  ssh-rsa AAAAB3NzaC1yc... user@hostname"
+    echo ""
+    printf "${RED}DO NOT paste your private key here!${NC}\n\n"
+
+    local key_valid=false
+    while [[ "$key_valid" == false ]]; do
+        printf "${BLUE}Paste your public key (then press Enter):${NC}\n"
+        read -r SSH_KEY
+
+        SSH_KEY=$(echo "$SSH_KEY" | xargs)
+
+        if [[ -z "$SSH_KEY" ]]; then
+            printf "${RED}ERROR: Key cannot be empty.${NC}\n"
+            continue
+        fi
+
+        if [[ "$SSH_KEY" =~ ^ssh-(ed25519|rsa|ecdsa|dsa)[[:space:]]+[A-Za-z0-9+/]+[=]{0,2} ]] || \
+           [[ "$SSH_KEY" =~ ^sk-ssh-(ed25519|ecdsa)@openssh\.com[[:space:]]+ ]]; then
+            key_valid=true
+            log "Valid SSH public key provided"
+            printf "${GREEN}Public key accepted.${NC}\n"
+        elif [[ "$SSH_KEY" =~ ^ecdsa-sha2-nistp[[:space:]]+[A-Za-z0-9+/]+[=]{0,2} ]]; then
+            key_valid=true
+            log "Valid SSH public key provided (ECDSA)"
+            printf "${GREEN}Public key accepted.${NC}\n"
+        else
+            printf "${RED}ERROR: This doesn't look like a valid SSH public key.${NC}\n"
+            echo "A valid key starts with 'ssh-ed25519', 'ssh-rsa', 'ssh-ecdsa', 'ssh-dsa',"
+            echo "'sk-ssh-ed25519@openssh.com', 'sk-ecdsa...p256@openssh.com', or 'ecdsa-sha2-nistp...'"
+            echo ""
+            local retry
+            read -rp "Try again? (yes/no): " retry
+            case "$retry" in
+                [Nn][Oo])
+                    log_error "User declined to provide valid SSH key"
+                    exit 1
+                    ;;
+            esac
+        fi
+    done
 }
 
 download_script() {
