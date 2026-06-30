@@ -712,9 +712,8 @@ EOF
     fi
 
     systemctl enable fail2ban
-    systemctl restart fail2ban
 
-    log "Fail2ban configured and started (escalating bans on port $SSH_PORT)"
+    log "Fail2ban configured (escalating bans on port $SSH_PORT)"
 }
 
 configure_auto_updates() {
@@ -950,6 +949,12 @@ echo ""
 printf "${YELLOW}Log File:${NC}\n"
 echo "  $LOG_FILE"
 echo ""
+
+if [[ "$USE_FAIL2BAN" == true ]] && [[ "$DRY_RUN" != true ]]; then
+    log "Applying fail2ban with reload-or-restart..."
+    systemctl reload-or-restart fail2ban
+fi
+
 printf "${RED}==========================================${NC}\n"
 printf "${RED}              IMPORTANT!${NC}\n"
 printf "${RED}==========================================${NC}\n\n"
