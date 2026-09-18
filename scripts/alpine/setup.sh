@@ -11,6 +11,10 @@
 #   wget https://raw.githubusercontent.com/joshuaromkes/crusty-system/main/scripts/alpine/setup.sh
 #   sh setup.sh
 #
+# Lockout safety: this script sets PermitRootLogin no — it REFUSES to
+# install your SSH key for root (that would lock you out). The key goes
+# to a non-root user detected via SUDO_USER/DOAS_USER, or create one first.
+#
 
 set -eu
 
@@ -32,6 +36,7 @@ USER_PUBLIC_KEY=""
 BACKUP_DIR="/root/crusty-backups-$(date +%Y%m%d_%H%M%S)"
 LOG_FILE="/var/log/alpine-setup.log"
 NON_INTERACTIVE=false
+MAINTENANCE_SCRIPT="/usr/local/sbin/crusty-maintenance"
 
 # Detect privilege escalation command (Alpine uses doas by default, fall back to sudo)
 if command -v doas >/dev/null 2>&1; then
@@ -201,17 +206,23 @@ prompt_sshd_setup() {
             continue
         fi
 
-        # Validate format (POSIX regex via case)
+        # Validate format: real key types + a base64 blob of >= 40 chars
+        # (rejects truncated pastes). ssh-dss (not "ssh-dsa"), ecdsa
+        # nistp256/384/521, and both sk- FIDO variants.
         case "$USER_PUBLIC_KEY" in
-            ssh-ed25519\ *|ssh-rsa\ *|ssh-dss\ *|ssh-ecdsa\ *|\
-            sk-ssh-ed25519@openssh.com\ *|sk-ssh-ecdsa@openssh.com\ *|\
-            ecdsa-sha2-nistp[0-9]*\ *)
-                _key_valid=true
-                printf "${GREEN}Public key accepted.${NC}\n"
+            ssh-ed25519\ *|ssh-rsa\ *|ssh-dss\ *|\
+            ecdsa-sha2-nistp256\ *|ecdsa-sha2-nistp384\ *|ecdsa-sha2-nistp521\ *|\
+            sk-ssh-ed25519@openssh.com\ *|sk-ecdsa-sha2-nistp256@openssh.com\ *)
+                if echo "$USER_PUBLIC_KEY" | awk 'NF >= 2 && length($2) >= 40 { exit 0 } exit 1'; then
+                    _key_valid=true
+                    printf "${GREEN}Public key accepted.${NC}\n"
+                else
+                    printf "${RED}ERROR: Key blob is too short — the paste looks truncated.${NC}\n"
+                fi
                 ;;
             *)
                 printf "${RED}ERROR: This doesn't look like a valid SSH public key.${NC}\n"
-                printf "Expected format: ssh-ed25519 AAAAC3NzaC... user@host\n"
+                printf "Expected format: ssh-ed25519 AAAAC3NzaC1lZDI1... user@host\n"
                 if ! prompt_yes_no "Try again?" "yes"; then
                     log_error "User declined to provide a valid SSH key"
                     exit 1
@@ -235,7 +246,11 @@ prompt_sshd_setup() {
                 if [ "$_port_input" -lt 1 ] || [ "$_port_input" -gt 65535 ]; then
                     printf "${RED}ERROR: Port must be between 1 and 65535.${NC}\n"
                 elif [ "$_port_input" -eq 22 ]; then
-                    printf "${RED}ERROR: Port 22 is the default — defeats hardening.${NC}\n"
+                    printf "${YELLOW}WARNING: Port 22 is the default SSH port — no obscurity benefit.${NC}\n"
+                    printf "Fine for NAT'd/LXC-style hosts behind a parent firewall.\n"
+                    if prompt_yes_no "Use port 22 anyway? (yes/no)" "no"; then
+                        _port_valid=true
+                    fi
                 elif [ "$_port_input" -eq 80 ] || [ "$_port_input" -eq 443 ]; then
                     printf "${RED}ERROR: Port ${_port_input} is used for HTTP/HTTPS.${NC}\n"
                 elif [ "$_port_input" -lt 1024 ]; then
@@ -290,7 +305,8 @@ prompt_auto_updates() {
     printf "${YELLOW}==========================================${NC}\n\n"
 
     printf "Automatic updates keep your system secure by installing\n"
-    printf "the latest packages on a regular schedule.\n\n"
+    printf "the latest packages on a regular schedule. The box only\n"
+    printf "reboots when packages actually changed.\n\n"
 
     if prompt_yes_no "Enable automatic updates? (yes/no) [default: yes]" "yes"; then
         ENABLE_AUTO_UPDATES=true
@@ -373,7 +389,10 @@ setup_sshd() {
         log_info "openssh already installed"
     fi
 
-    # Get the user's home directory
+    # Determine the target user for the SSH key.
+    # NEVER root: this script writes 'PermitRootLogin no' + disables
+    # password auth — a key in /root with no other keyed account is a
+    # guaranteed lockout (console-only recovery).
     if [ -n "${SUDO_USER:-}" ]; then
         _ssh_user="$SUDO_USER"
     elif [ -n "${DOAS_USER:-}" ]; then
@@ -382,11 +401,25 @@ setup_sshd() {
         _ssh_user="root"
     fi
 
-    # Determine home directory
     if [ "$_ssh_user" = "root" ]; then
-        _user_home="/root"
-    else
-        _user_home="/home/$_ssh_user"
+        log_error "REFUSING to install an SSH key for root."
+        log_error "This script sets 'PermitRootLogin no' AND 'PasswordAuthentication no'."
+        log_error "A key in /root with no other keyed account = permanent SSH lockout."
+        echo ""
+        log "Pick ONE of these, then re-run:"
+        log "  1. Run via ${ESCALATE:-doas/sudo} from your regular admin user."
+        log "  2. Create a non-root user first, e.g.:"
+        echo "       adduser -D <username> && adduser <username> wheel"
+        echo "       (then add your key to /home/<username>/.ssh/authorized_keys)"
+        echo ""
+        exit 1
+    fi
+
+    # Resolve the home directory from /etc/passwd (POSIX, no getent needed)
+    _user_home=$(awk -F: -v u="$_ssh_user" '$1 == u {print $6; exit}' /etc/passwd)
+    if [ -z "$_user_home" ] || [ ! -d "$_user_home" ]; then
+        log_error "Cannot resolve a home directory for '$_ssh_user' — refusing to continue."
+        exit 1
     fi
 
     # Setup authorized_keys
@@ -394,6 +427,7 @@ setup_sshd() {
     _auth_keys="$_ssh_dir/authorized_keys"
 
     log "Setting up authorized_keys for user: $_ssh_user"
+    log "Home directory: $_user_home"
     mkdir -p "$_ssh_dir"
     chmod 700 "$_ssh_dir"
 
@@ -405,8 +439,12 @@ setup_sshd() {
     fi
 
     chmod 600 "$_auth_keys"
-    if [ "$_ssh_user" != "root" ]; then
-        chown -R "$_ssh_user:$_ssh_user" "$_ssh_dir" 2>/dev/null || true
+    chown -R "$_ssh_user:$_ssh_user" "$_ssh_dir" 2>/dev/null || true
+
+    # Verify the key landed BEFORE any auth restriction is applied
+    if ! grep -qF "$USER_PUBLIC_KEY" "$_auth_keys"; then
+        log_error "Key verification failed — aborting before disabling root/password login."
+        exit 1
     fi
 
     # Backup existing sshd_config
@@ -415,7 +453,9 @@ setup_sshd() {
         cp /etc/ssh/sshd_config "$BACKUP_DIR/sshd_config.backup"
     fi
 
-    # Write hardened sshd_config
+    # Write hardened sshd_config.
+    # NOTE: no ChallengeResponseAuthentication (deprecated alias) —
+    # keyboard-interactive is PAM-managed on modern OpenSSH.
     cat > /etc/ssh/sshd_config << EOF
 # SSH Hardened Configuration - Generated by Crusty System (Alpine)
 Port $SSH_PORT
@@ -425,7 +465,6 @@ PermitRootLogin no
 PubkeyAuthentication yes
 PasswordAuthentication no
 PermitEmptyPasswords no
-ChallengeResponseAuthentication no
 UsePAM yes
 
 # Key algorithms
@@ -465,7 +504,16 @@ EOF
         ssh-keygen -t rsa -f /etc/ssh/ssh_host_rsa_key -N '' >/dev/null 2>&1
     fi
 
-    # Enable and start SSH service (OpenRC)
+    # Pre-flight the new config before touching the running sshd
+    if ! sshd -t -f /etc/ssh/sshd_config >/dev/null 2>&1; then
+        log_error "New sshd_config FAILED 'sshd -t' pre-flight — restoring backup."
+        if [ -f "$BACKUP_DIR/sshd_config.backup" ]; then
+            cp "$BACKUP_DIR/sshd_config.backup" /etc/ssh/sshd_config
+        fi
+        exit 1
+    fi
+
+    # Enable and start SSH service (OpenRC) — with rollback on failure
     rc-update add sshd default 2>/dev/null || rc-update add sshd
     rc-service sshd restart || {
         log_error "Failed to restart SSH!"
@@ -476,7 +524,7 @@ EOF
         exit 1
     }
 
-    log "SSH server configured on port $SSH_PORT"
+    log "SSH server configured on port $SSH_PORT for user $_ssh_user"
 }
 
 setup_ufw() {
@@ -590,18 +638,77 @@ setup_auto_updates() {
         log_info "cron daemon already installed"
     fi
 
-    # Add cron job to root's crontab
-    _cron_entry="${UPDATE_MINUTE} ${UPDATE_HOUR} * * * /sbin/apk update && /sbin/apk upgrade --available && /sbin/reboot"
+    # Install the LOCAL maintenance script the cron will run.
+    # The cron NEVER downloads anything; the box only reboots when
+    # packages actually changed (apk-changes marker).
+    log "Installing local maintenance script: $MAINTENANCE_SCRIPT"
+    cat > "$MAINTENANCE_SCRIPT" << 'MAINT_EOF'
+#!/bin/sh
+#
+# Crusty System — Alpine daily local maintenance.
+# NEVER downloads anything. Runs apk update/upgrade and reboots
+# ONLY when the package set actually changed.
+# Log: /var/log/crusty-maintenance.log
+#
+
+LOG_FILE="/var/log/crusty-maintenance.log"
+
+log() {
+    printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$LOG_FILE" 2>/dev/null || true
+}
+
+# Serialize — never run two maintenance jobs at once
+if command -v flock >/dev/null 2>&1; then
+    exec 9>/var/run/crusty-maintenance.lock
+    if ! flock -n 9; then
+        log "another maintenance instance is running — exiting"
+        exit 0
+    fi
+fi
+
+log "=== crusty daily maintenance start ==="
+
+# Marker: package state before the upgrade
+_pre=$(apk info -v 2>/dev/null | sort)
+
+if apk update -q >/dev/null 2>&1; then
+    log "OK: apk update"
+else
+    log "FAILED: apk update"
+fi
+if apk upgrade --available -q >/dev/null 2>&1; then
+    log "OK: apk upgrade"
+else
+    log "FAILED: apk upgrade"
+fi
+
+# Reboot ONLY if the package set changed (apk-changes marker)
+_post=$(apk info -v 2>/dev/null | sort)
+if [ "$_pre" != "$_post" ]; then
+    log "packages changed — rebooting"
+    log "=== crusty daily maintenance end (rebooting) ==="
+    /sbin/reboot
+else
+    log "no package changes — skipping reboot"
+fi
+
+log "=== crusty daily maintenance end ==="
+MAINT_EOF
+    chmod 755 "$MAINTENANCE_SCRIPT"
+
+    # Cron entry: runs ONLY the local maintenance script (no downloads,
+    # no unconditional reboot)
+    _cron_entry="${UPDATE_MINUTE} ${UPDATE_HOUR} * * * ${MAINTENANCE_SCRIPT}"
 
     # Alpine's default cron daemon reads /etc/crontabs/root
     mkdir -p /etc/crontabs
 
     if [ -f /etc/crontabs/root ]; then
-        # Remove any existing crusty auto-update line
-        sed -i '/crusty.*auto.update/d' /etc/crontabs/root 2>/dev/null || true
+        # Remove any existing crusty auto-update lines (legacy versions)
+        sed -i '/crusty/d' /etc/crontabs/root 2>/dev/null || true
     fi
 
-    echo "# Crusty System — automatic updates at ${UPDATE_HOUR}:${UPDATE_MINUTE} daily" >> /etc/crontabs/root
+    echo "# Crusty System — daily LOCAL maintenance at ${UPDATE_HOUR}:${UPDATE_MINUTE} (no downloads; reboots only when packages changed)" >> /etc/crontabs/root
     echo "$_cron_entry" >> /etc/crontabs/root
 
     # Signal crond to reload (via cron.update file)
@@ -611,7 +718,7 @@ setup_auto_updates() {
     rc-service crond start 2>/dev/null || true
     rc-update add crond default 2>/dev/null || true
 
-    log "Automatic updates configured (daily at ${UPDATE_HOUR}:${UPDATE_MINUTE})"
+    log "Automatic updates configured (daily at ${UPDATE_HOUR}:${UPDATE_MINUTE} — local maintenance only)"
 }
 
 # ─── Summary ──────────────────────────────────────────────────
@@ -627,16 +734,17 @@ print_summary() {
     printf "  Packages installed: %s\n" "${ADDITIONAL_PACKAGES:-none}"
     if [ "$INSTALL_SSHD" = true ]; then
         printf "  SSH Port:           %s\n" "$SSH_PORT"
+        printf "  Key installed for:  %s\n" "${_ssh_user:-<user>}"
         printf "  Root Login:         Disabled\n"
         printf "  Password Auth:      Disabled (key-only)\n"
     fi
     printf "  Firewall:           %s\n" "$(if [ "$USE_UFW" = true ]; then echo "UFW enabled"; else echo "none"; fi)"
-    printf "  Fail2ban:           %s\n" "$(if [ "$USE_FAIL2BAN" = true ]; then echo "active"; else echo "skipped"; fi)"
-    printf "  Auto Updates:       %s\n" "$(if [ "$ENABLE_AUTO_UPDATES" = true ]; then echo "daily at ${UPDATE_HOUR}:${UPDATE_MINUTE}"; else echo "none"; fi)"
+    printf "  Fail2ban:            %s\n" "$(if [ "$USE_FAIL2BAN" = true ]; then echo "configured + running"; else echo "skipped"; fi)"
+    printf "  Auto Updates:       %s\n" "$(if [ "$ENABLE_AUTO_UPDATES" = true ]; then echo "daily at ${UPDATE_HOUR}:${UPDATE_MINUTE} (reboots only when changed)"; else echo "none"; fi)"
 
     if [ "$INSTALL_SSHD" = true ]; then
         printf "\n${YELLOW}SSH Connection:${NC}\n"
-        printf "  ssh -p %s %s@%s\n" "$SSH_PORT" "$(whoami)" "$_ip"
+        printf "  ssh -p %s %s@%s\n" "$SSH_PORT" "${_ssh_user:-<user>}" "$_ip"
     fi
 
     printf "\n${YELLOW}Backup Location:${NC}\n"
@@ -649,9 +757,9 @@ print_summary() {
         printf "${RED}              IMPORTANT!${NC}\n"
         printf "${RED}==========================================${NC}\n\n"
         printf "${YELLOW}1. DO NOT close this session until you test the new SSH connection!${NC}\n"
-        printf "   ${GREEN}ssh -p %s %s@%s${NC}\n\n" "$SSH_PORT" "$(whoami)" "$_ip"
+        printf "   ${GREEN}ssh -p %s %s@%s${NC}\n\n" "$SSH_PORT" "${_ssh_user:-<user>}" "$_ip"
         printf "${YELLOW}2. Password authentication is DISABLED — use your SSH key${NC}\n\n"
-        printf "${YELLOW}3. Keep your private key safe — there is no password fallback!${NC}\n"
+        printf "${YELLOW}3. Keep your private key safe — there is no password fallback!${NC}\n\n"
     fi
     printf "\n"
 }
@@ -666,6 +774,9 @@ for _arg in "$@"; do
             echo ""
             echo "Alpine Linux Setup Script — installs packages, configures SSH,"
             echo "UFW firewall, fail2ban, and automatic updates."
+            echo ""
+            echo "NOTE: refuses to install the SSH key for root (it sets"
+            echo "PermitRootLogin no). Run via doas/sudo from your admin user."
             echo ""
             echo "One-liner:"
             echo "  curl -sSL https://raw.githubusercontent.com/joshuaromkes/crusty-system/main/scripts/alpine/setup.sh | sh"

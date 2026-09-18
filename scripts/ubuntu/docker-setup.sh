@@ -30,7 +30,7 @@ best practices (log rotation, no-new-privileges, live-restore).
 
 OPTIONS:
   --user USER          Add USER to the docker group
-  --prune-cron         Install a weekly cron job to prune unused Docker data
+  --prune-cron         Install a weekly cron job to prune unused Docker images
   --non-interactive    Skip all prompts
   --help, -h           Show this help
 
@@ -160,8 +160,33 @@ DAEMON_EOF
         return 0
     fi
 
-    log_warn "daemon.json exists but missing some security keys — overwriting"
-    echo "$desired" > "$DAEMON_JSON"
+    # M3: MERGE the desired keys into the existing daemon.json instead of
+    # overwriting it — operator customizations (registry mirrors, MTU, ...)
+    # survive. jq deep-merges with our keys winning only where we set them.
+    if command -v jq &>/dev/null; then
+        log "Merging security settings into existing daemon.json (jq)..."
+        cp "$DAEMON_JSON" "${DAEMON_JSON}.pre-crusty.bak"
+        local desired_tmp merge_tmp
+        desired_tmp=$(mktemp)
+        merge_tmp=$(mktemp)
+        printf '%s\n' "$desired" > "$desired_tmp"
+        if jq -s '.[0] * .[1]' "$DAEMON_JSON" "$desired_tmp" > "$merge_tmp" && jq empty "$merge_tmp"; then
+            mv -f "$merge_tmp" "$DAEMON_JSON"
+            rm -f "$desired_tmp"
+            log "daemon.json merged (previous copy: ${DAEMON_JSON}.pre-crusty.bak)"
+        else
+            rm -f "$desired_tmp" "$merge_tmp"
+            log_error "jq merge failed — daemon.json left untouched"
+            return 1
+        fi
+    else
+        # No jq: back up first, then overwrite (custom keys are lost but
+        # recoverable from the backup)
+        log_warn "jq not available — backing up daemon.json and overwriting it"
+        log_warn "Custom keys will be lost; restore/merge them from the backup"
+        cp "$DAEMON_JSON" "${DAEMON_JSON}.pre-crusty.bak"
+        echo "$desired" > "$DAEMON_JSON"
+    fi
 
     systemctl restart docker
     log "Docker daemon configured and restarted"
@@ -192,19 +217,21 @@ configure_prune_cron() {
         return 0
     fi
 
-    if [[ -f "$PRUNE_CRON_FILE" ]]; then
-        log_info "Docker prune cron already configured"
-        return 0
-    fi
-
-    log "Setting up weekly Docker prune cron job..."
+    # H9: prune IMAGES only. Never `system prune` and never `--volumes` —
+    # volume deletion destroyed data of stopped-but-kept stacks. The exit
+    # code is logged so silent failures are visible. Always (re)written so
+    # re-running replaces the old destructive `system prune -af --volumes`
+    # cron line on boxes deployed earlier.
+    log "Setting up weekly Docker image prune cron job (images only — volumes are NEVER pruned)..."
     cat > "$PRUNE_CRON_FILE" << 'EOF'
-# Crusty System - Weekly Docker system prune (Sunday 03:00)
+# Crusty System - Weekly Docker image prune (Sunday 03:00)
+# IMAGES ONLY — volumes and other data are never touched.
+# Exit code is logged via syslog (tag: crusty-docker-prune).
 SHELL=/bin/bash
-0 3 * * 0 root /usr/bin/docker system prune -af --volumes --filter "until=168h" 2>&1 | logger -t crusty-docker-prune
+0 3 * * 0 root /bin/bash -c 'rc=0; /usr/bin/docker image prune -af --filter "until=168h" >/dev/null 2>&1 || rc=$?; /usr/bin/logger -t crusty-docker-prune "image prune rc=$rc"'
 EOF
     chmod 644 "$PRUNE_CRON_FILE"
-    log "Docker prune cron installed (weekly Sunday 03:00)"
+    log "Docker prune cron installed (weekly Sunday 03:00, images only, rc logged)"
 }
 
 main() {
@@ -247,12 +274,27 @@ main() {
     if [[ -n "$DOCKER_USER" ]]; then
         printf "${YELLOW}User '$DOCKER_USER' added to docker group.${NC}\n"
         printf "${YELLOW}Log out and back in for group membership to take effect.${NC}\n"
+        printf "${RED}NOTE: docker group membership is ROOT-EQUIVALENT on this host.${NC}\n"
+        echo ""
     fi
 
     if [[ "$PRUNE_CRON" == true ]]; then
-        echo "  - Docker prune cron: weekly Sunday 03:00"
+        echo "  - Docker prune cron: weekly Sunday 03:00 (images only, volumes never pruned)"
     fi
     echo ""
+
+    # H2: Docker + UFW perimeter truth — published ports bypass UFW.
+    printf "${RED}==========================================${NC}\n"
+    printf "${RED}  SECURITY NOTE — Docker published ports BYPASS UFW${NC}\n"
+    printf "${RED}==========================================${NC}\n\n"
+    printf "${YELLOW}Any port published with -p (e.g. -p 8080:80) is reachable from${NC}\n"
+    printf "${YELLOW}the network EVEN WITH 'ufw default deny incoming'. Docker inserts${NC}\n"
+    printf "${YELLOW}its own iptables rules that run BEFORE UFW.${NC}\n\n"
+    printf "Mitigations:\n"
+    printf "  - Publish to loopback only: -p 127.0.0.1:8080:80 (then reverse-proxy)\n"
+    printf "  - Or restrict access via the DOCKER-USER chain\n"
+    printf "  - Or filter at an upstream/host firewall\n\n"
+    printf "${YELLOW}'Firewall: UFW enabled' does NOT close published Docker ports.${NC}\n\n"
 }
 
 main "$@"

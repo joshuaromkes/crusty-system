@@ -3,6 +3,17 @@
 # Auto Update Script for Ubuntu Server
 # Configures automatic weekly system updates
 #
+# DESIGN (operator requirement): the weekly cron runs ONLY the local
+# maintenance script (/opt/crusty-system/scripts/ubuntu/maintenance.sh).
+# It NEVER downloads anything from the network — no curl, no script
+# fetches, no one-line megacommand. Crusty scripts are updated by
+# re-running the setup one-liner (SHA-256 verified), not by cron.
+#
+# The maintenance script performs: apt-get update, apt-get upgrade
+# (never full-upgrade), autoremove --purge, autoclean, and a reboot
+# ONLY if /var/run/reboot-required exists. Every step and its exit
+# code is logged to /var/log/crusty-maintenance.log.
+#
 
 set -euo pipefail
 
@@ -18,6 +29,7 @@ log_warn() { printf "${YELLOW}[%s] WARNING:${NC} %s\n" "$(date +'%Y-%m-%d %H:%M:
 log_error() { printf "${RED}[%s] ERROR:${NC} %s\n" "$(date +'%Y-%m-%d %H:%M:%S')" "$1"; }
 
 CRON_FILE="/etc/cron.d/crusty-auto-update"
+MAINTENANCE_SCRIPT="/opt/crusty-system/scripts/ubuntu/maintenance.sh"
 UPDATE_HOUR="02"
 UPDATE_MINUTE="00"
 NON_INTERACTIVE=false
@@ -27,6 +39,9 @@ usage() {
 Usage: $0 [OPTION]
 
 Configure automatic weekly system updates for Debian/Ubuntu.
+
+The weekly cron runs ONLY the local maintenance script — it never
+downloads anything. Log: /var/log/crusty-maintenance.log
 
 OPTIONS:
   install            Install and configure auto-updates (default)
@@ -98,48 +113,130 @@ prompt_update_time() {
     printf "${GREEN}Update time set to: ${UPDATE_HOUR}:${UPDATE_MINUTE}${NC}\n"
 }
 
+# Install the LOCAL maintenance script the cron will run.
+# Keep in sync with scripts/ubuntu/maintenance.sh (canonical copy).
+install_maintenance_script() {
+    mkdir -p "$(dirname "$MAINTENANCE_SCRIPT")"
+    cat > "$MAINTENANCE_SCRIPT" << 'MAINT_EOF'
+#!/bin/bash
+#
+# Crusty System — Weekly Local Maintenance (Debian/Ubuntu)
+#
+# DESIGN RULE (operator requirement): this script NEVER downloads anything.
+# It performs local apt maintenance only. Crusty scripts themselves are
+# updated by re-running the setup one-liner (which verifies each downloaded
+# script against SHA-256 pins embedded in setup.sh) — the cron never fetches.
+#
+# All steps and their exit codes are logged to /var/log/crusty-maintenance.log
+# so silent failures are visible (unlike the old one-line cron command).
+#
+# Canonical copy: scripts/ubuntu/maintenance.sh in joshuaromkes/crusty-system.
+# ssh-hardener.sh and auto-update.sh embed this same content — keep in sync.
+#
+
+set -u  # NOT -e: we run every step and log failures instead of aborting midway
+
+LOG_FILE="/var/log/crusty-maintenance.log"
+
+log() {
+    printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$LOG_FILE" 2>/dev/null || true
+}
+
+run_step() {
+    # run_step "description" command [args...] — logs OK/FAILED + exit code
+    local desc="$1"
+    shift
+    if "$@" >> "$LOG_FILE" 2>&1; then
+        log "OK: $desc"
+    else
+        local rc=$?
+        log "FAILED (rc=$rc): $desc"
+    fi
+}
+
+# Serialize — never run two maintenance jobs at once
+if command -v flock >/dev/null 2>&1; then
+    exec 9>/var/run/crusty-maintenance.lock
+    if ! flock -n 9; then
+        log "another maintenance instance is running — exiting"
+        exit 0
+    fi
+fi
+
+log "=== crusty weekly maintenance start ==="
+
+run_step "apt update"              /usr/bin/apt-get update -qq
+run_step "apt upgrade"             /usr/bin/apt-get upgrade -y -qq
+run_step "apt autoremove --purge"  /usr/bin/apt-get autoremove --purge -y -qq
+run_step "apt autoclean"           /usr/bin/apt-get autoclean
+
+# Conditional reboot — ONLY when the OS explicitly flags it
+if [[ -f /var/run/reboot-required ]]; then
+    log "reboot required (/var/run/reboot-required) — scheduling reboot in 5 minutes"
+    /usr/sbin/shutdown -r +5 "Crusty System: reboot required after updates" >> "$LOG_FILE" 2>&1
+else
+    log "no reboot required"
+fi
+
+log "=== crusty weekly maintenance end ==="
+MAINT_EOF
+    chmod 755 "$MAINTENANCE_SCRIPT"
+
+    if [[ ! -x "$MAINTENANCE_SCRIPT" ]]; then
+        log_error "Failed to install maintenance script at $MAINTENANCE_SCRIPT"
+        exit 1
+    fi
+    log "Local maintenance script installed: $MAINTENANCE_SCRIPT"
+}
+
 create_cron_job() {
-    log "Creating weekly update cron job for ${UPDATE_HOUR}:${UPDATE_MINUTE}..."
+    log "Creating weekly maintenance cron job for ${UPDATE_HOUR}:${UPDATE_MINUTE}..."
+
+    install_maintenance_script
+
+    # Always (re)written: replaces any legacy network-fetching cron line
+    # (curl mega-command) so re-running this script heals deployed boxes.
     cat > "$CRON_FILE" << EOF
-# Crusty System - Combined weekly maintenance job (script download + apt updates + conditional reboot)
-# Runs weekly on Sunday at ${UPDATE_HOUR}:${UPDATE_MINUTE}
-# Downloads latest scripts, then runs apt update, full-upgrade, autoremove, autoclean, and reboots if needed
+# Crusty System - Weekly LOCAL maintenance (runs Sunday at ${UPDATE_HOUR}:${UPDATE_MINUTE})
+# Local apt maintenance ONLY — this cron NEVER downloads anything.
+# Crusty scripts update by re-running the setup one-liner (SHA-256 verified).
+# Log: /var/log/crusty-maintenance.log
 SHELL=/bin/bash
-${UPDATE_MINUTE} ${UPDATE_HOUR} * * 0 root mkdir -p /opt/crusty-system && curl -fsSL "https://raw.githubusercontent.com/joshuaromkes/crusty-system/main/setup.sh" -o /opt/crusty-system/setup.sh && curl -fsSL "https://raw.githubusercontent.com/joshuaromkes/crusty-system/main/scripts/ubuntu/ssh-hardener.sh" -o /opt/crusty-system/scripts/ubuntu/ssh-hardener.sh && curl -fsSL "https://raw.githubusercontent.com/joshuaromkes/crusty-system/main/scripts/ubuntu/docker-setup.sh" -o /opt/crusty-system/scripts/ubuntu/docker-setup.sh && curl -fsSL "https://raw.githubusercontent.com/joshuaromkes/crusty-system/main/scripts/ubuntu/auto-update.sh" -o /opt/crusty-system/scripts/ubuntu/auto-update.sh && /usr/bin/apt update -qq && /usr/bin/apt full-upgrade -y -qq && /usr/bin/apt autoremove --purge -y -qq && /usr/bin/apt autoclean && if [ -f /var/run/reboot-required ]; then /usr/sbin/shutdown -r +5 "Crusty System: reboot required after updates"; fi
+${UPDATE_MINUTE} ${UPDATE_HOUR} * * 0 root ${MAINTENANCE_SCRIPT}
 EOF
     chmod 644 "$CRON_FILE"
-    log "Cron job created at $CRON_FILE"
+    log "Cron job created at $CRON_FILE (runs ONLY the local maintenance script)"
 }
 
 run_updates_now() {
-    # Scripts are auto-updated in the weekly cron job — this function only runs apt maintenance.
+    # Immediate maintenance — same chain as the weekly cron (no downloads)
     echo ""
     log "Starting immediate system update..."
     echo ""
 
-    log "Running: apt update"
-    if ! apt update -qq; then
+    log "Running: apt-get update"
+    if ! apt-get update -qq; then
         log_error "Failed to update package list"
         return 1
     fi
     log "Package list updated successfully"
 
     echo ""
-    log "Running: apt full-upgrade -y"
-    if ! apt full-upgrade -y -qq; then
+    log "Running: apt-get upgrade -y"
+    if ! apt-get upgrade -y -qq; then
         log_error "Failed to upgrade packages"
         return 1
     fi
     log "System packages upgraded successfully"
 
     echo ""
-    log "Running: apt autoremove --purge -y"
-    apt autoremove --purge -y -qq
+    log "Running: apt-get autoremove --purge -y"
+    apt-get autoremove --purge -y -qq
     log "Orphaned packages removed"
 
     echo ""
-    log "Running: apt autoclean"
-    apt autoclean
+    log "Running: apt-get autoclean"
+    apt-get autoclean
     log "Package cache cleaned"
 
     echo ""
@@ -187,6 +284,11 @@ uninstall_auto_updates() {
         log_warn "Cron job not found at $CRON_FILE"
     fi
 
+    if [[ -f "$MAINTENANCE_SCRIPT" ]]; then
+        log "Removing maintenance script: $MAINTENANCE_SCRIPT"
+        rm -f "$MAINTENANCE_SCRIPT"
+    fi
+
     echo ""
     echo "=========================================="
     log "Uninstallation Complete!"
@@ -194,6 +296,7 @@ uninstall_auto_updates() {
     echo ""
     printf "${GREEN}Removed:${NC}\n"
     echo "  - Cron job: $CRON_FILE"
+    echo "  - Maintenance script: $MAINTENANCE_SCRIPT"
     echo ""
 }
 
@@ -208,6 +311,9 @@ show_config() {
         printf "${GREEN}Cron Job:${NC}\n"
         echo "  Schedule: Weekly on Sunday"
         grep -v "^#" "$CRON_FILE" | grep -v "^SHELL=" | head -1
+        if grep -q "curl" "$CRON_FILE"; then
+            log_warn "Legacy network-fetching cron detected — run 'install' to replace it"
+        fi
         echo ""
     else
         printf "${YELLOW}No cron job found.${NC}\n"
@@ -249,9 +355,7 @@ parse_args() {
 
 install_auto_updates() {
     if [[ -f "$CRON_FILE" ]]; then
-        log_info "Auto-update cron already configured at $CRON_FILE"
-        show_config
-        return 0
+        log_info "Auto-update cron exists — rewriting it to ensure the local-only version"
     fi
 
     log "Starting Auto Update Setup..."
@@ -276,7 +380,10 @@ install_auto_updates() {
     echo ""
     printf "${GREEN}Configuration Summary:${NC}\n"
     echo "  - Update Schedule: Weekly at ${UPDATE_HOUR}:${UPDATE_MINUTE} (Sunday)"
+    echo "  - Maintenance: LOCAL script only ($MAINTENANCE_SCRIPT)"
+    echo "  - No network downloads from cron — scripts update via the setup one-liner"
     echo "  - Reboot: Conditional (only if /var/run/reboot-required exists, +5 min delay)"
+    echo "  - Log: /var/log/crusty-maintenance.log"
     echo ""
 
     if [[ "$NON_INTERACTIVE" != true ]]; then
@@ -284,8 +391,8 @@ install_auto_updates() {
     fi
 
     echo ""
-    printf "${GREEN}To manually trigger an update later, run:${NC}\n"
-    echo "  sudo apt update && sudo apt full-upgrade -y && sudo apt autoremove --purge -y && sudo apt autoclean"
+    printf "${GREEN}To manually trigger maintenance later, run:${NC}\n"
+    echo "  sudo $MAINTENANCE_SCRIPT"
     echo ""
 }
 

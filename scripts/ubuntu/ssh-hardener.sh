@@ -4,6 +4,24 @@
 # Configures SSH security, firewall, fail2ban, and automatic updates
 # Supports both interactive (TTY) and non-interactive (CLI args) modes
 #
+# Lockout-safety design (learned from real incidents — see git history):
+#   - REFUSES to install an SSH key for root when PermitRootLogin no will
+#     apply. Key goes to a designated non-root user (--user), which must
+#     exist on the box. Never a silent lockout. (C1)
+#   - sshd_config candidate is pre-flighted with `sshd -t`, atomically
+#     replaced, and on restart/listener failure the backup is restored and
+#     the script EXITS 1 — never log-and-continue. (C2)
+#   - sshd is restarted and verified listening on the NEW port BEFORE any
+#     firewall changes; the old port is temporarily allowed during the
+#     transition and the temp rule removed after verification. (C3)
+#   - UFW is never blindly reset — existing rules are preserved. (M6)
+#   - fail2ban is reloaded with `fail2ban-client reload`, NEVER restarted —
+#     restarts historically severed live SSH sessions (commits
+#     395c2d1 / 4df6ab3 / 451bc62). (H1)
+#   - The weekly cron runs ONLY the local maintenance script — it never
+#     downloads anything from the network. Scripts are updated by
+#     re-running the setup one-liner. (C4/C5)
+#
 
 set -euo pipefail
 
@@ -23,11 +41,24 @@ UPDATE_MINUTE="00"
 USER_PUBLIC_KEY=""
 ALLOW_TCP_FORWARDING="no"      # "no" | "local" | "yes"
 DRY_RUN=false
-SKIP_UFW=false
 NON_INTERACTIVE=false
-CURRENT_USER="${SUDO_USER:-${USER:-root}}"
+
+# Key-install target user — resolved by resolve_target_user(); NEVER root
+TARGET_USER=""
+TARGET_HOME=""
+CURRENT_USER="(unresolved)"
+
 BACKUP_DIR="/root/crusty-backups-$(date +%Y%m%d_%H%M%S)"
 LOG_FILE="/var/log/ssh-hardener.log"
+
+# Local maintenance script installed for the weekly cron (cron never downloads)
+MAINTENANCE_SCRIPT="/opt/crusty-system/scripts/ubuntu/maintenance.sh"
+CRON_FILE="/etc/cron.d/crusty-auto-update"
+
+# Ports sshd currently listens on (captured BEFORE the config is replaced)
+CURRENT_SSH_PORTS=()
+# Ports we temporarily allowed in UFW during the port transition
+UFW_TEMP_PORTS=()
 
 # Logging functions
 log() {
@@ -57,8 +88,13 @@ SSH Hardener for Debian/Ubuntu — configures SSH hardening, UFW firewall,
 fail2ban intrusion prevention, and automatic updates.
 
 OPTIONS (non-interactive mode — skips all prompts):
-  --port PORT            SSH port (1-65535, default: 58432)
+  --port PORT            SSH port (1-65535, default: 58432; 22 is allowed
+                         for NAT'd/LXC-style hosts behind a parent firewall)
   --key "PUBLIC_KEY"     SSH public key for authorized_keys
+  --user USER            Non-root user to install the key for (required when
+                         running as actual root with no SUDO_USER — the key
+                         is NEVER installed for root because this script
+                         sets PermitRootLogin no)
   --allow-tcp-forwarding MODE   "no" (default), "local", or "yes"
   --no-fail2ban          Skip fail2ban installation
   --no-auto-updates      Skip automatic updates configuration
@@ -72,11 +108,14 @@ Examples:
   # Interactive (default)
   sudo $0
 
-  # Non-interactive with key from file
-  sudo $0 --port 58432 --key "\$(cat ~/.ssh/id_ed25519.pub)"
+  # Non-interactive with key from file, key installed for 'josh'
+  sudo $0 --port 58432 --key "\$(cat ~/.ssh/id_ed25519.pub)" --user josh
 
-  # Headless provisioning — just SSH + firewall, no fail2ban/updates
-  sudo $0 --key "\$(cat authorized_key.pub)" --no-fail2ban --no-auto-updates
+  # Run via sudo from your admin user (target user auto-detected)
+  sudo $0 --key "\$(cat ~/.ssh/id_ed25519.pub)"
+
+  # LXC-style host that keeps port 22
+  sudo $0 --port 22 --key "\$(cat ~/.ssh/id_ed25519.pub)" --user josh
 
   # Preview changes
   sudo $0 --port 2222 --key "\$(cat ~/.ssh/id_ed25519.pub)" --dry-run
@@ -91,6 +130,12 @@ parse_args() {
                 SSH_PORT="$2"; shift 2 ;;
             --key)
                 USER_PUBLIC_KEY="$2"; NON_INTERACTIVE=true; shift 2 ;;
+            --user)
+                if [[ -z "${2:-}" ]]; then
+                    log_error "--user requires a username"
+                    exit 1
+                fi
+                TARGET_USER="$2"; shift 2 ;;
             --allow-tcp-forwarding)
                 ALLOW_TCP_FORWARDING="$2"; shift 2 ;;
             --no-fail2ban)
@@ -98,7 +143,15 @@ parse_args() {
             --no-auto-updates)
                 ENABLE_AUTO_UPDATES=false; shift ;;
             --update-time)
-                UPDATE_HOUR="${2:0:2}"; UPDATE_MINUTE="${2:3:2}"; shift 2 ;;
+                local t="${2:-}"
+                if [[ "$t" =~ ^([0-9]{1,2}):([0-9]{2})$ ]]; then
+                    printf -v UPDATE_HOUR "%02d" "$((10#${BASH_REMATCH[1]}))"
+                    printf -v UPDATE_MINUTE "%02d" "$((10#${BASH_REMATCH[2]}))"
+                else
+                    log_error "Invalid --update-time: '$t' (use HH:MM)"
+                    exit 1
+                fi
+                shift 2 ;;
             --dry-run)
                 DRY_RUN=true; shift ;;
             --help|-h)
@@ -121,6 +174,35 @@ parse_args() {
         no|local|yes) ;;
         *) log_error "Invalid --allow-tcp-forwarding value: $ALLOW_TCP_FORWARDING (use: no, local, yes)"; exit 1 ;;
     esac
+}
+
+# ─────────────────────────────────────────────────────────────
+# SSH public key validation (H10)
+#
+# Regex accepts: ssh-ed25519, ssh-rsa, ssh-dss (NOT "ssh-dsa"),
+# ecdsa-sha2-nistp256|384|521, sk-ssh-ed25519@openssh.com,
+# sk-ecdsa-sha2-nistp256@openssh.com — each with a base64 blob of
+# >= 40 chars (rejects truncated pastes). When ssh-keygen is available
+# it is the authoritative check (ssh-keygen -lf -).
+# ─────────────────────────────────────────────────────────────
+validate_public_key() {
+    local key="$1"
+
+    if [[ "$key" =~ ^ssh-(ed25519|rsa|dss)[[:space:]]+[A-Za-z0-9+/]{40,}[=]{0,3} ]] || \
+       [[ "$key" =~ ^ecdsa-sha2-nistp(256|384|521)[[:space:]]+[A-Za-z0-9+/]{40,}[=]{0,3} ]] || \
+       [[ "$key" =~ ^(sk-ssh-ed25519@openssh\.com|sk-ecdsa-sha2-nistp256@openssh\.com)[[:space:]]+[A-Za-z0-9+/]{40,}[=]{0,3} ]]; then
+        # Deep validation when possible — catches truncated/corrupt blobs
+        # that still pass the charset+length regex
+        if command -v ssh-keygen &>/dev/null; then
+            if printf '%s\n' "$key" | ssh-keygen -lf - &>/dev/null; then
+                return 0
+            fi
+            log_error "Key rejected by ssh-keygen (malformed or truncated)"
+            return 1
+        fi
+        return 0
+    fi
+    return 1
 }
 
 # ─────────────────────────────────────────────────────────────
@@ -201,40 +283,81 @@ check_and_install_openssh() {
     done
 }
 
+# C1: resolve the user the SSH key will be installed for, and REFUSE root.
+# This script sets PermitRootLogin no + PasswordAuthentication no — a key
+# in /root with no other keyed account is a guaranteed lockout (console only).
+resolve_target_user() {
+    if [[ -n "$TARGET_USER" ]]; then
+        log_info "Target user (from --user): $TARGET_USER"
+    elif [[ -n "${SUDO_USER:-}" ]]; then
+        TARGET_USER="$SUDO_USER"
+        log_info "Target user (from sudo): $TARGET_USER"
+    else
+        TARGET_USER="root"
+    fi
+
+    if [[ "$TARGET_USER" == "root" ]]; then
+        log_error "REFUSING to install an SSH key for root."
+        log_error "This script sets 'PermitRootLogin no' AND 'PasswordAuthentication no'."
+        log_error "A key in /root with no other keyed account = permanent SSH lockout (console-only recovery)."
+        echo ""
+        log "Pick ONE of these, then re-run:"
+        log "  1. Run via sudo from your regular admin user:"
+        echo "       sudo $0 --key \"ssh-ed25519 AAAA...\""
+        log "  2. Create an admin user first, then re-run with --user:"
+        echo "       useradd -m -s /bin/bash -G sudo <username>"
+        echo "       $0 --key \"ssh-ed25519 AAAA...\" --user <username>"
+        echo ""
+        exit 1
+    fi
+
+    if ! getent passwd "$TARGET_USER" >/dev/null 2>&1; then
+        log_error "Target user '$TARGET_USER' does not exist on this system."
+        log_error "Create it first: useradd -m -s /bin/bash -G sudo $TARGET_USER"
+        exit 1
+    fi
+
+    TARGET_HOME=$(getent passwd "$TARGET_USER" | cut -d: -f6)
+    if [[ -z "$TARGET_HOME" || ! -d "$TARGET_HOME" ]]; then
+        log_error "Cannot resolve a home directory for '$TARGET_USER' (got: '${TARGET_HOME:-empty}')"
+        log_error "Refusing to continue — never write keys to an unknown location."
+        exit 1
+    fi
+
+    CURRENT_USER="$TARGET_USER"
+
+    # After this run, root login is SSH-disabled — make sure the target user
+    # can actually administer the box (warn only: custom sudoers are possible)
+    if ! id -nG "$TARGET_USER" 2>/dev/null | tr ' ' '\n' | grep -qx -e sudo -e wheel \
+       && ! grep -rqs "$TARGET_USER" /etc/sudoers /etc/sudoers.d 2>/dev/null; then
+        log_warn "'$TARGET_USER' is not in the 'sudo'/'wheel' group and has no sudoers entry."
+        log_warn "After this run, remote administration of this box may be impossible."
+        log_warn "Verify admin access for '$TARGET_USER' before proceeding."
+    fi
+}
+
+# C3: remember which port(s) sshd listens on right now, so the firewall can
+# keep the old port reachable during the transition to the new port.
+detect_current_ssh_ports() {
+    CURRENT_SSH_PORTS=()
+    local p
+    while read -r p; do
+        [[ -n "$p" ]] && CURRENT_SSH_PORTS+=("$p")
+    done < <(awk '$1 == "Port" {print $2}' /etc/ssh/sshd_config 2>/dev/null || true)
+
+    if [[ ${#CURRENT_SSH_PORTS[@]} -eq 0 ]]; then
+        CURRENT_SSH_PORTS=(22)   # no Port directive = default 22
+    fi
+    log_info "sshd currently listens on port(s): ${CURRENT_SSH_PORTS[*]}"
+}
+
 check_existing_ufw() {
-    # Warn if UFW is already active with custom rules before resetting
+    # Informational only — we never reset UFW, so existing rules are safe.
     if command -v ufw &>/dev/null && ufw status 2>/dev/null | grep -q "Status: active"; then
         local rule_count
-        rule_count=$(ufw status numbered 2>/dev/null | grep -c '^\[' || echo 0)
-
+        rule_count=$(ufw status numbered 2>/dev/null | grep -c '^\[' || true)
         if [[ "$rule_count" -gt 0 ]]; then
-            log_warn "UFW is already active with $rule_count existing rule(s)"
-
-            if [[ "$NON_INTERACTIVE" == true ]]; then
-                # Check if existing rules already match what we want
-                if ufw status 2>/dev/null | grep -qE "($SSH_PORT/tcp.*(ALLOW|LIMIT)|(ALLOW|LIMIT).*$SSH_PORT/tcp)"; then
-                    log_info "UFW already configured correctly with port $SSH_PORT — skipping firewall setup"
-                    SKIP_UFW=true
-                    return 0
-                fi
-
-                log_error "UFW has existing rules but running in non-interactive mode."
-                log_error "Use --dry-run first to review, or clear UFW rules before running."
-                log_error "Refusing to reset UFW without confirmation."
-                exit 1
-            fi
-
-            printf "\n${RED}WARNING: UFW is already active with ${rule_count} existing rule(s).${NC}\n"
-            printf "${YELLOW}This script will RESET all UFW rules and replace them.${NC}\n"
-            echo "Current rules:"
-            ufw status numbered 2>/dev/null
-            echo ""
-            local confirm
-            read -rp "Proceed with UFW reset? (yes/no): " confirm < /dev/tty
-            case "$confirm" in
-                [Yy][Ee][Ss]) return 0 ;;
-                *) log_error "User declined UFW reset. Exiting."; exit 1 ;;
-            esac
+            log_info "UFW is active with $rule_count existing rule(s) — they will be PRESERVED (no reset)"
         fi
     fi
 }
@@ -258,7 +381,7 @@ show_key_generation_instructions() {
     printf "2. Run: ssh-keygen -t ed25519 -C \"your_email@example.com\"\n"
     printf "3. Press Enter to accept default location\n"
     printf "4. Enter a passphrase (recommended) or press Enter for none\n"
-    printf "5. Your public key is at: C:\\Users\\YOUR_USERNAME\\.ssh\\id_ed25519.pub\n\n"
+    printf "5. Your public key is at: C:\\\\Users\\\\YOUR_USERNAME\\\\.ssh\\\\id_ed25519.pub\n\n"
     printf "${GREEN}--- Windows (PuTTY) ---${NC}\n"
     printf "1. Download PuTTYgen from: https://www.chiark.greenend.org.uk/~sgtatham/putty/latest.html\n"
     printf "2. Open PuTTYgen, select 'Ed25519' as the key type\n"
@@ -286,9 +409,10 @@ prompt_public_key() {
     printf "${YELLOW}==========================================${NC}\n\n"
     echo "Please paste your SSH PUBLIC key below."
     echo "The key should look like one of these formats:"
-    echo "  ssh-ed25519 AAAAC3NzaC... user@hostname"
-    echo "  sk-ssh-ed25519@openssh.com AAAAGnNr... user@hostname"
-    echo "  ssh-rsa AAAAB3NzaC1yc... user@hostname"
+    echo "  ssh-ed25519 AAAAC3NzaC1lZDI1... user@hostname"
+    echo "  ssh-rsa AAAAB3NzaC1yc2EAAA... user@hostname"
+    echo "  ecdsa-sha2-nistp256 AAAAE2VjZHNh... user@hostname"
+    echo "  sk-ssh-ed25519@openssh.com AAAAGnNrLqg... user@hostname"
     echo ""
     printf "${RED}DO NOT paste your private key here!${NC}\n\n"
     printf "${YELLOW}TIP: If you're using VNC/console and copy-paste doesn't work,${NC}\n"
@@ -307,20 +431,16 @@ prompt_public_key() {
             continue
         fi
 
-        # Accept standard OpenSSH keys + FIDO2/U2F hardware keys
-        if [[ "$USER_PUBLIC_KEY" =~ ^ssh-(ed25519|rsa|ecdsa|dsa)[[:space:]]+[A-Za-z0-9+/]+[=]{0,2} ]] || \
-           [[ "$USER_PUBLIC_KEY" =~ ^sk-ssh-(ed25519|ecdsa)@openssh\.com[[:space:]]+ ]]; then
+        if validate_public_key "$USER_PUBLIC_KEY"; then
             key_valid=true
             log "Valid SSH public key provided"
             printf "${GREEN}Public key accepted.${NC}\n"
-        elif [[ "$USER_PUBLIC_KEY" =~ ^ecdsa-sha2-nistp[[:space:]]+[A-Za-z0-9+/]+[=]{0,2} ]]; then
-            key_valid=true
-            log "Valid SSH public key provided (ECDSA)"
-            printf "${GREEN}Public key accepted.${NC}\n"
         else
             printf "${RED}ERROR: This doesn't look like a valid SSH public key.${NC}\n"
-            echo "A valid key starts with 'ssh-ed25519', 'ssh-rsa', 'ssh-ecdsa', 'ssh-dsa',"
-            echo "'sk-ssh-ed25519@openssh.com', 'sk-ecds...p256@openssh.com', or 'ecdsa-sha2-nistp...'"
+            echo "A valid key starts with one of:"
+            echo "  ssh-ed25519, ssh-rsa, ssh-dss, ecdsa-sha2-nistp256|384|521,"
+            echo "  sk-ssh-ed25519@openssh.com, sk-ecdsa-sha2-nistp256@openssh.com"
+            echo "followed by a long base64 blob."
             echo ""
             local retry
             read -rp "Try again? (yes/no): " retry < /dev/tty
@@ -404,7 +524,8 @@ prompt_ssh_port() {
     printf "${YELLOW}=== SSH Port Configuration ===${NC}\n\n"
     echo "Please specify the desired SSH port."
     echo "Valid range: 1-65535"
-    echo "Commonly used ports to avoid: 22 (default SSH), 80 (HTTP), 443 (HTTPS)"
+    echo "Commonly used ports to avoid: 80 (HTTP), 443 (HTTPS)"
+    echo "Port 22 is allowed for NAT'd/LXC-style hosts behind a parent firewall."
     echo ""
 
     local valid=false
@@ -417,8 +538,14 @@ prompt_ssh_port() {
         if [[ "$port_input" =~ ^[0-9]+$ ]]; then
             if [[ "$port_input" -ge 1 && "$port_input" -le 65535 ]]; then
                 if [[ "$port_input" -eq 22 ]]; then
-                    printf "${RED}ERROR: Port 22 is the default SSH port. Using it defeats the purpose of hardening.${NC}\n"
-                    echo "Please choose a different port."
+                    printf "${YELLOW}WARNING: Port 22 is the default SSH port — no obscurity benefit.${NC}\n"
+                    echo "Fine for NAT'd/LXC-style hosts where a parent firewall handles filtering."
+                    local confirm
+                    read -rp "Use port 22 anyway? (yes/no): " confirm < /dev/tty
+                    case "$confirm" in
+                        [Yy][Ee][Ss]) valid=true ;;
+                        *) echo "Please choose a different port." ;;
+                    esac
                 elif [[ "$port_input" -eq 80 ]]; then
                     printf "${RED}ERROR: Port 80 is used for HTTP. Please choose a different port.${NC}\n"
                 elif [[ "$port_input" -eq 443 ]]; then
@@ -453,7 +580,7 @@ prompt_auto_updates() {
     printf "${YELLOW}=== Automatic Updates Configuration ===${NC}\n\n"
     echo "Automatic updates help keep your system secure by installing"
     echo "security patches and updates on a regular schedule."
-    echo "The server will restart after updates to ensure all changes take effect."
+    echo "The server reboots after updates ONLY if the OS flags a reboot as required."
     echo ""
 
     local response
@@ -523,42 +650,153 @@ prompt_update_time() {
 # ─────────────────────────────────────────────────────────────
 
 setup_authorized_keys() {
-    local user_home
-    if [[ -n "$SUDO_USER" ]]; then
-        user_home=$(getent passwd "$SUDO_USER" | cut -d: -f6)
-    else
-        user_home="$HOME"
+    if [[ "$DRY_RUN" == true ]]; then
+        log_info "[DRY RUN] Would install your public key for '$TARGET_USER' in $TARGET_HOME/.ssh/authorized_keys"
+        return 0
     fi
 
+    local user_home="$TARGET_HOME"
     local ssh_dir="$user_home/.ssh"
     local auth_keys_file="$ssh_dir/authorized_keys"
+    local key_line="$USER_PUBLIC_KEY"
 
-    log "Setting up authorized_keys for user: $CURRENT_USER"
+    log "Setting up authorized_keys for user: $TARGET_USER"
     log "Home directory: $user_home"
+
+    # M5: warn about group/world-writable home — sshd StrictModes REFUSES
+    # keys from such homes ("Authentication refused: bad ownership")
+    local home_mode
+    home_mode=$(stat -c '%a' "$user_home" 2>/dev/null || echo 0)
+    if (( (8#$home_mode & 8#022) != 0 )); then
+        log_warn "Home directory $user_home is group/world-writable (mode $home_mode)"
+        log_warn "sshd StrictModes will REFUSE key auth from this home directory."
+        log_warn "Fix it: chmod go-w $user_home"
+    fi
 
     mkdir -p "$ssh_dir"
     chmod 700 "$ssh_dir"
 
-    # Check if key already exists in authorized_keys
-    if [[ -f "$auth_keys_file" ]] && grep -qF "$USER_PUBLIC_KEY" "$auth_keys_file"; then
+    # M7: atomic, dedup-safe append — temp file in the same dir, then mv.
+    # Trailing whitespace in existing lines no longer defeats the dup check.
+    local tmp="$auth_keys_file.tmp.$$"
+    if [[ -f "$auth_keys_file" ]]; then
+        cp "$auth_keys_file" "$tmp"
+    fi
+    if awk -v k="$key_line" '{ gsub(/[[:space:]]+$/, ""); if ($0 == k) found=1 } END { exit found ? 0 : 1 }' "$tmp" 2>/dev/null; then
         log "Public key already present in authorized_keys — skipping"
     else
-        # Append instead of overwrite (preserves existing keys)
-        echo "$USER_PUBLIC_KEY" >> "$auth_keys_file"
+        printf '%s\n' "$key_line" >> "$tmp"
         log "Public key appended to authorized_keys"
     fi
-
+    chmod 600 "$tmp"
+    mv -f "$tmp" "$auth_keys_file"
+    chown -R "$TARGET_USER:" "$ssh_dir"
+    chmod 700 "$ssh_dir"
     chmod 600 "$auth_keys_file"
 
-    if [[ -n "$SUDO_USER" ]]; then
-        chown -R "$SUDO_USER:$SUDO_USER" "$ssh_dir"
-        log "Ownership set to $SUDO_USER:$SUDO_USER"
+    # C1: verify the key actually landed BEFORE any auth restriction is applied
+    if ! grep -qF "$key_line" "$auth_keys_file"; then
+        log_error "Key verification FAILED — aborting before disabling root/password login."
+        exit 1
     fi
+    log "Verified: key present in $auth_keys_file for $TARGET_USER"
+}
+
+# H4: /etc/ssh/sshd_config.d drop-ins override the main config and can
+# silently re-enable PasswordAuthentication / PermitRootLogin. Move them to
+# the backup dir before writing our config.
+handle_sshd_dropins() {
+    local dropin_dir="/etc/ssh/sshd_config.d"
+    [[ -d "$dropin_dir" ]] || return 0
+
+    local moved=0 f
+    mkdir -p "$BACKUP_DIR/sshd_config.d"
+    for f in "$dropin_dir"/*.conf; do
+        if [[ -f "$f" ]]; then
+            mv "$f" "$BACKUP_DIR/sshd_config.d/"
+            log_warn "Moved conflicting drop-in to backup: $f -> $BACKUP_DIR/sshd_config.d/"
+            moved=$((moved + 1))
+        fi
+    done
+
+    if [[ "$moved" -gt 0 ]]; then
+        log_warn "NOTE: cloud-init may recreate drop-ins on boot. Re-run this script"
+        log_warn "after a reboot, or disable cloud-init's ssh config module in /etc/cloud/cloud.cfg.d/"
+    fi
+}
+
+# H5: OpenSSH 8.7+ uses KbdInteractiveAuthentication; the old
+# ChallengeResponseAuthentication name is a deprecated no-op alias on 9.8+.
+# Probe which one this sshd understands instead of hardcoding either.
+kbdinteractive_supported() {
+    local probe
+    probe=$(mktemp)
+    printf 'KbdInteractiveAuthentication no\n' > "$probe"
+    local ok=false
+    if sshd -t -f "$probe" >/dev/null 2>&1; then
+        ok=true
+    fi
+    rm -f "$probe"
+    [[ "$ok" == true ]]
+}
+
+restart_sshd() {
+    # Try ssh first (Debian default unit name), then sshd
+    if systemctl restart ssh 2>/dev/null; then
+        log "SSH service restarted (ssh.service)"
+        return 0
+    fi
+    if systemctl restart sshd 2>/dev/null; then
+        log "SSH service restarted (sshd.service)"
+        return 0
+    fi
+    log_error "Cannot restart SSH service (tried ssh and sshd)"
+    return 1
+}
+
+# C2: restore the pre-run config and restart. Temporary UFW rules for the
+# OLD port are intentionally KEPT so the box stays reachable after rollback.
+rollback_ssh_config() {
+    if [[ -f "$BACKUP_DIR/sshd_config.backup" ]]; then
+        cp "$BACKUP_DIR/sshd_config.backup" /etc/ssh/sshd_config
+        if restart_sshd; then
+            log "Rolled back sshd_config and restarted sshd on the previous port"
+        else
+            log_error "Rollback restart ALSO failed — use the console NOW."
+            log_error "Backup of the original config: $BACKUP_DIR/sshd_config.backup"
+        fi
+    else
+        log_error "No backup available for rollback ($BACKUP_DIR/sshd_config.backup missing)"
+    fi
+    log_error "SSH hardening ABORTED — the live config was restored to its pre-run state."
+}
+
+# C3: verify sshd actually has a listener on the given port
+verify_ssh_listener() {
+    local port="$1"
+    local tries=15 i
+    for ((i = 1; i <= tries; i++)); do
+        if command -v ss &>/dev/null; then
+            if ss -tln 2>/dev/null | grep -q ":$port[[:space:]]"; then
+                return 0
+            fi
+        elif command -v netstat &>/dev/null; then
+            if netstat -tln 2>/dev/null | grep -q ":$port[[:space:]]"; then
+                return 0
+            fi
+        else
+            log_warn "Neither ss nor netstat available — cannot verify listener"
+            return 0
+        fi
+        sleep 1
+    done
+    return 1
 }
 
 apply_ssh_config() {
     if [[ "$DRY_RUN" == true ]]; then
         log_info "[DRY RUN] Would write hardened sshd_config on port $SSH_PORT"
+        log_info "[DRY RUN]   (sshd -t pre-flight + atomic replace + rollback on failure)"
         return 0
     fi
 
@@ -567,10 +805,28 @@ apply_ssh_config() {
     mkdir -p "$BACKUP_DIR"
     cp /etc/ssh/sshd_config "$BACKUP_DIR/sshd_config.backup"
 
-    old_hash=$(md5sum /etc/ssh/sshd_config 2>/dev/null | cut -d" " -f1)
+    # H4: neutralize drop-ins that could override our hardening
+    handle_sshd_dropins
 
-    cat > /etc/ssh/sshd_config << EOF
+    # H5: pick the keyboard-interactive directive this OpenSSH supports
+    local kbd_line
+    if kbdinteractive_supported; then
+        kbd_line="KbdInteractiveAuthentication no"
+    else
+        # pre-8.7 name — the real option there, not a deprecated alias
+        kbd_line="ChallengeResponseAuthentication no"
+    fi
+
+    # Ensure host keys referenced below exist (fresh boxes / stripped images)
+    ssh-keygen -A >/dev/null 2>&1 || true
+
+    # C2: write the candidate to a temp file FIRST — the live config is
+    # never touched until the candidate passes `sshd -t`.
+    local candidate="/etc/ssh/sshd_config.new.$$"
+    cat > "$candidate" << EOF
 # SSH Hardened Configuration - Generated by Crusty System
+# NOTE: sshd uses first-obtained-value-wins. Hardened directives below take
+# precedence over anything included from sshd_config.d at the end.
 # Port configuration
 Port $SSH_PORT
 
@@ -579,7 +835,7 @@ PermitRootLogin no
 PubkeyAuthentication yes
 PasswordAuthentication no
 PermitEmptyPasswords no
-ChallengeResponseAuthentication no
+$kbd_line
 UsePAM yes
 
 # Key algorithms
@@ -609,48 +865,127 @@ MaxStartups 10:30:60
 # Logging
 SyslogFacility AUTH
 LogLevel INFO
+
+# Include distro/cloud drop-ins LAST — our hardened values above win
+Include /etc/ssh/sshd_config.d/*.conf
 EOF
 
-    new_hash=$(md5sum /etc/ssh/sshd_config | cut -d" " -f1)
+    # C2: pre-flight — a bad directive must NEVER kill sshd mid-run
+    if ! sshd -t -f "$candidate"; then
+        log_error "Candidate sshd_config FAILED 'sshd -t' pre-flight — live config untouched"
+        log_error "Fix the error above (often an unsupported directive for this OpenSSH version)"
+        rm -f "$candidate"
+        exit 1
+    fi
 
+    # Idempotency: skip the restart if nothing would change
+    local old_hash new_hash
+    old_hash=$(md5sum /etc/ssh/sshd_config 2>/dev/null | cut -d' ' -f1)
+    new_hash=$(md5sum "$candidate" | cut -d' ' -f1)
     if [[ "$old_hash" == "$new_hash" ]]; then
         log_info "SSH config unchanged — skipping restart"
+        rm -f "$candidate"
         return 0
     fi
 
-    # Restart SSH — try ssh first (Debian default), then sshd
-    if systemctl restart ssh 2>/dev/null; then
-        log "SSH service restarted (ssh.service)"
-    elif systemctl restart sshd 2>/dev/null; then
-        log "SSH service restarted (sshd.service)"
-    else
-        log_error "Cannot restart SSH service (tried ssh and sshd)"
+    # C2: atomic replace + restart, with hard rollback on failure
+    chmod 600 "$candidate"
+    chown root:root "$candidate"
+    mv -f "$candidate" /etc/ssh/sshd_config
+
+    if ! restart_sshd; then
+        log_error "sshd restart FAILED — rolling back to the previous config"
+        rollback_ssh_config
+        exit 1
     fi
 
-    log "SSH configuration applied on port $SSH_PORT"
+    # C3: verify the NEW port is actually live before firewall changes.
+    # A restart that returns 0 but left no listener is still a lockout.
+    if ! verify_ssh_listener "$SSH_PORT"; then
+        log_error "sshd is NOT listening on port $SSH_PORT — rolling back"
+        rollback_ssh_config
+        exit 1
+    fi
+
+    log "SSH configuration applied and verified on port $SSH_PORT"
+}
+
+# C3: before sshd moves to the new port, make sure the OLD port stays
+# reachable through UFW during the transition (only when UFW is active).
+maybe_allow_old_ssh_ports() {
+    if [[ "$DRY_RUN" == true ]]; then
+        return 0
+    fi
+    command -v ufw &>/dev/null || return 0
+    ufw status 2>/dev/null | grep -q "Status: active" || return 0
+
+    local p
+    for p in "${CURRENT_SSH_PORTS[@]}"; do
+        if [[ "$p" == "$SSH_PORT" ]]; then
+            continue
+        fi
+        # only add a temp rule if the old port isn't already allowed
+        if ! ufw status | awk -v rule="$p/tcp" '$1 == rule' | grep -q .; then
+            if ufw allow "$p"/tcp comment 'crusty-ssh-transition (temporary)' >/dev/null 2>&1; then
+                UFW_TEMP_PORTS+=("$p")
+                log "Temporarily allowing old SSH port $p/tcp during the transition"
+            fi
+        fi
+    done
+}
+
+# C3: remove temporary old-port rules once the new port is verified
+remove_temp_ufw_rules() {
+    local p
+    for p in "${UFW_TEMP_PORTS[@]}"; do
+        if ufw delete allow "$p"/tcp >/dev/null 2>&1; then
+            log "Removed temporary UFW rule for old SSH port $p/tcp"
+        else
+            log_warn "Could not remove temporary UFW rule for $p/tcp — remove manually: ufw delete allow $p/tcp"
+        fi
+    done
+    UFW_TEMP_PORTS=()
 }
 
 configure_firewall() {
-    if [[ "$SKIP_UFW" == true ]]; then
-        log_info "UFW already configured — skipping"
-        return 0
-    fi
-
     if [[ "$DRY_RUN" == true ]]; then
-        log_info "[DRY RUN] Would reset UFW, allow port $SSH_PORT/tcp, and enable firewall"
+        log_info "[DRY RUN] Would ensure UFW allows $SSH_PORT/tcp (preserving existing rules — no reset) and enable UFW"
         return 0
     fi
 
-    log "Configuring UFW firewall..."
+    log "Configuring UFW firewall (existing rules are preserved — NO reset)..."
 
-    ufw --force reset
-    ufw default deny incoming
-    ufw default allow outgoing
-    ufw allow "$SSH_PORT"/tcp comment 'SSH'
-    ufw logging on
+    local ufw_was_active=false
+    if ufw status 2>/dev/null | grep -q "Status: active"; then
+        ufw_was_active=true
+    fi
+
+    # M6: no 'ufw --force reset' — never destroy the operator's existing rules.
+    # Idempotently make sure the new SSH port is allowed.
+    if ! ufw status | awk -v rule="$SSH_PORT/tcp" '$1 == rule' | grep -q .; then
+        ufw allow "$SSH_PORT"/tcp comment 'SSH'
+    fi
+
+    if [[ "$ufw_was_active" == false ]]; then
+        # Fresh/inactive firewall — set hardened defaults
+        ufw default deny incoming
+        ufw default allow outgoing
+    else
+        log_info "UFW already active — keeping existing policy and rules untouched"
+    fi
+
+    ufw logging on || true
     ufw --force enable
 
-    log "UFW firewall configured — SSH allowed on port $SSH_PORT"
+    if ! ufw status 2>/dev/null | grep -q "Status: active"; then
+        log_error "UFW failed to become active"
+        exit 1
+    fi
+
+    # C3: transition complete — drop the temporary old-port rules
+    remove_temp_ufw_rules
+
+    log "UFW firewall active — SSH allowed on port $SSH_PORT"
 }
 
 configure_fail2ban() {
@@ -662,7 +997,7 @@ configure_fail2ban() {
     fi
 
     if [[ "$DRY_RUN" == true ]]; then
-        log_info "[DRY RUN] Would install fail2ban with escalating bans on port $SSH_PORT"
+        log_info "[DRY RUN] Would install fail2ban with escalating bans on port $SSH_PORT, then reload it"
         return 0
     fi
 
@@ -672,12 +1007,10 @@ configure_fail2ban() {
     local auth_log="/var/log/auth.log"
     [[ -f "$auth_log" ]] || auth_log="/var/log/secure"
 
+    local old_hash=""
     if [[ -f /etc/fail2ban/jail.local ]]; then
         old_hash=$(md5sum /etc/fail2ban/jail.local | cut -d" " -f1)
-    else
-        old_hash=""
     fi
-    log "DEBUG: writing new jail.local..."
 
     cat > /etc/fail2ban/jail.local << EOF
 [DEFAULT]
@@ -710,25 +1043,125 @@ maxretry = 3
 bantime = 3600
 findtime = 600
 EOF
-    log "DEBUG: new config written, hashing..."
 
+    local new_hash
     if [[ -f /etc/fail2ban/jail.local ]]; then
         new_hash=$(md5sum /etc/fail2ban/jail.local | cut -d" " -f1)
     else
         new_hash=""
     fi
-    log "DEBUG: comparing hashes..."
 
-    if [[ "$old_hash" == "$new_hash" ]]; then
-        log_info "fail2ban jail.local unchanged — skipping restart"
-        return 0
+    systemctl enable fail2ban
+
+    if [[ "$old_hash" != "$new_hash" ]]; then
+        # H1: the config must take effect NOW, not after a reboot.
+        # RELOAD only — fail2ban restarts historically severed live SSH
+        # sessions (git 395c2d1 / 4df6ab3 / 451bc62); reload is non-disruptive.
+        if systemctl is-active --quiet fail2ban; then
+            if fail2ban-client reload; then
+                log "Fail2ban reloaded (fail2ban-client reload — no restart, no session disruption)"
+            else
+                log_error "fail2ban-client reload failed — check: journalctl -u fail2ban"
+            fi
+        else
+            systemctl start fail2ban
+            log "Fail2ban started (was inactive)"
+        fi
+        FAIL2BAN_CHANGED=true
+    else
+        log_info "fail2ban jail.local unchanged — ensuring service is active"
+        if ! systemctl is-active --quiet fail2ban; then
+            systemctl start fail2ban
+            log "Fail2ban started (was inactive)"
+        fi
     fi
 
-    log "DEBUG: config changed, enabling fail2ban service..."
-    systemctl enable fail2ban
-    FAIL2BAN_CHANGED=true
+    # H1: verify the sshd jail actually took effect on the new port
+    local i
+    for ((i = 1; i <= 10; i++)); do
+        if fail2ban-client status sshd &>/dev/null; then
+            log "Verified: fail2ban sshd jail is active (monitoring port $SSH_PORT)"
+            return 0
+        fi
+        sleep 1
+    done
+    log_warn "Could not verify fail2ban sshd jail yet — check manually: fail2ban-client status sshd"
+}
 
-    log "Fail2ban configured (escalating bans on port $SSH_PORT)"
+# C4/C5: install the LOCAL maintenance script the weekly cron will run.
+# The cron NEVER downloads anything — scripts are updated by re-running
+# the setup one-liner. Keep in sync with scripts/ubuntu/maintenance.sh.
+install_maintenance_script() {
+    mkdir -p "$(dirname "$MAINTENANCE_SCRIPT")"
+    cat > "$MAINTENANCE_SCRIPT" << 'MAINT_EOF'
+#!/bin/bash
+#
+# Crusty System — Weekly Local Maintenance (Debian/Ubuntu)
+#
+# DESIGN RULE (operator requirement): this script NEVER downloads anything.
+# It performs local apt maintenance only. Crusty scripts themselves are
+# updated by re-running the setup one-liner (which verifies each downloaded
+# script against SHA-256 pins embedded in setup.sh) — the cron never fetches.
+#
+# All steps and their exit codes are logged to /var/log/crusty-maintenance.log
+# so silent failures are visible (unlike the old one-line cron command).
+#
+# Canonical copy: scripts/ubuntu/maintenance.sh in joshuaromkes/crusty-system.
+# ssh-hardener.sh and auto-update.sh embed this same content — keep in sync.
+#
+
+set -u  # NOT -e: we run every step and log failures instead of aborting midway
+
+LOG_FILE="/var/log/crusty-maintenance.log"
+
+log() {
+    printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$LOG_FILE" 2>/dev/null || true
+}
+
+run_step() {
+    # run_step "description" command [args...] — logs OK/FAILED + exit code
+    local desc="$1"
+    shift
+    if "$@" >> "$LOG_FILE" 2>&1; then
+        log "OK: $desc"
+    else
+        local rc=$?
+        log "FAILED (rc=$rc): $desc"
+    fi
+}
+
+# Serialize — never run two maintenance jobs at once
+if command -v flock >/dev/null 2>&1; then
+    exec 9>/var/run/crusty-maintenance.lock
+    if ! flock -n 9; then
+        log "another maintenance instance is running — exiting"
+        exit 0
+    fi
+fi
+
+log "=== crusty weekly maintenance start ==="
+
+run_step "apt update"              /usr/bin/apt-get update -qq
+run_step "apt upgrade"             /usr/bin/apt-get upgrade -y -qq
+run_step "apt autoremove --purge"  /usr/bin/apt-get autoremove --purge -y -qq
+run_step "apt autoclean"           /usr/bin/apt-get autoclean
+
+# Conditional reboot — ONLY when the OS explicitly flags it
+if [[ -f /var/run/reboot-required ]]; then
+    log "reboot required (/var/run/reboot-required) — scheduling reboot in 5 minutes"
+    /usr/sbin/shutdown -r +5 "Crusty System: reboot required after updates" >> "$LOG_FILE" 2>&1
+else
+    log "no reboot required"
+fi
+
+log "=== crusty weekly maintenance end ==="
+MAINT_EOF
+    chmod 755 "$MAINTENANCE_SCRIPT"
+
+    if [[ ! -x "$MAINTENANCE_SCRIPT" ]]; then
+        log_error "Failed to install maintenance script at $MAINTENANCE_SCRIPT"
+        exit 1
+    fi
 }
 
 configure_auto_updates() {
@@ -738,7 +1171,7 @@ configure_auto_updates() {
     fi
 
     if [[ "$DRY_RUN" == true ]]; then
-        log_info "[DRY RUN] Would configure unattended-upgrades + weekly cron at ${UPDATE_HOUR}:${UPDATE_MINUTE}"
+        log_info "[DRY RUN] Would configure unattended-upgrades + weekly LOCAL maintenance cron at ${UPDATE_HOUR}:${UPDATE_MINUTE}"
         return 0
     fi
 
@@ -778,21 +1211,23 @@ Unattended-Upgrade::Remove-Unused-Dependencies "true";
 Unattended-Upgrade::Automatic-Reboot "false";
 EOF
 
-    # Root crontab — no sudo needed
-    if [[ -f /etc/cron.d/crusty-auto-update ]]; then
-        log_info "Auto-update cron already exists — skipping"
-        return 0
-    fi
-    cat > /etc/cron.d/crusty-auto-update << EOF
-# Crusty System - Combined weekly maintenance job (script download + apt updates + conditional reboot)
-# Runs weekly on Sunday at ${UPDATE_HOUR}:${UPDATE_MINUTE}
-# Downloads latest scripts, then runs apt update, full-upgrade, autoremove, autoclean, and reboots if needed
-SHELL=/bin/bash
-${UPDATE_MINUTE} ${UPDATE_HOUR} * * 0 root mkdir -p /opt/crusty-system && curl -fsSL "https://raw.githubusercontent.com/joshuaromkes/crusty-system/main/setup.sh" -o /opt/crusty-system/setup.sh && curl -fsSL "https://raw.githubusercontent.com/joshuaromkes/crusty-system/main/scripts/ubuntu/ssh-hardener.sh" -o /opt/crusty-system/scripts/ubuntu/ssh-hardener.sh && curl -fsSL "https://raw.githubusercontent.com/joshuaromkes/crusty-system/main/scripts/ubuntu/docker-setup.sh" -o /opt/crusty-system/scripts/ubuntu/docker-setup.sh && curl -fsSL "https://raw.githubusercontent.com/joshuaromkes/crusty-system/main/scripts/ubuntu/auto-update.sh" -o /opt/crusty-system/scripts/ubuntu/auto-update.sh && /usr/bin/apt update -qq && /usr/bin/apt full-upgrade -y -qq && /usr/bin/apt autoremove --purge -y -qq && /usr/bin/apt autoclean && if [ -f /var/run/reboot-required ]; then /usr/sbin/shutdown -r +5 "Crusty System: reboot required after updates"; fi
-EOF
-    chmod 644 /etc/cron.d/crusty-auto-update
+    # C4/C5: the weekly cron runs ONLY the local maintenance script.
+    # No curl, no script downloads, no one-line megacommand. Always
+    # (re)written — this replaces any legacy network-fetching cron on
+    # re-run (re-running the one-liner heals deployed boxes).
+    install_maintenance_script
 
-    log "Automatic updates configured (weekly at ${UPDATE_HOUR}:${UPDATE_MINUTE})"
+    cat > "$CRON_FILE" << EOF
+# Crusty System - Weekly LOCAL maintenance (runs Sunday at ${UPDATE_HOUR}:${UPDATE_MINUTE})
+# Local apt maintenance ONLY — this cron NEVER downloads anything.
+# Crusty scripts update by re-running the setup one-liner (SHA-256 verified).
+# Log: /var/log/crusty-maintenance.log
+SHELL=/bin/bash
+${UPDATE_MINUTE} ${UPDATE_HOUR} * * 0 root ${MAINTENANCE_SCRIPT}
+EOF
+    chmod 644 "$CRON_FILE"
+
+    log "Automatic updates configured (weekly at ${UPDATE_HOUR}:${UPDATE_MINUTE} — local maintenance only)"
 }
 
 backup_configs() {
@@ -843,16 +1278,23 @@ if [[ "$DRY_RUN" == true ]]; then
     echo ""
 fi
 
+# C1: resolve + validate the target user BEFORE touching anything
+resolve_target_user
+
 check_and_install_openssh
 
 # Non-interactive: use CLI args; Interactive: prompt
 if [[ "$NON_INTERACTIVE" == true ]]; then
     log "Running in non-interactive mode"
 
-    # Validate key was provided
+    # Validate key was provided (H10: validated even non-interactively)
     if [[ -z "$USER_PUBLIC_KEY" ]]; then
         log_error "Non-interactive mode requires --key with a public key"
         echo "Usage: $0 --key \"ssh-ed25519 AAAAC3NzaC...\" [other options]"
+        exit 1
+    fi
+    if ! validate_public_key "$USER_PUBLIC_KEY"; then
+        log_error "The provided --key failed validation — refusing to continue"
         exit 1
     fi
 else
@@ -870,26 +1312,30 @@ printf "${GREEN}    Starting SSH Hardening Process${NC}\n"
 printf "${GREEN}==========================================${NC}\n\n"
 
 log "Starting SSH Hardener Script..."
+log "SSH key will be installed for: $TARGET_USER ($TARGET_HOME)"
 
-# Check for existing UFW rules before proceeding
+# Check for existing UFW rules (informational — they are preserved)
 check_existing_ufw
+
+# C3: capture the port(s) sshd listens on right now
+detect_current_ssh_ports
 
 # Backup existing configurations
 backup_configs
 
-# Update system packages (with error handling)
-log "Updating system packages..."
-if ! apt-get update -qq; then
-    log_error "apt-get update failed — check network connection"
-    exit 1
-fi
-if ! apt-get upgrade -y -qq; then
-    log_warn "apt-get upgrade had errors — continuing anyway (some packages may be held)"
-fi
+# Update system packages (with error handling) — skipped in dry-run
+if [[ "$DRY_RUN" != true ]]; then
+    log "Updating system packages..."
+    if ! apt-get update -qq; then
+        log_error "apt-get update failed — check network connection"
+        exit 1
+    fi
+    if ! apt-get upgrade -y -qq; then
+        log_warn "apt-get upgrade had errors — continuing anyway (some packages may be held)"
+    fi
 
-# Install required packages
-log "Installing required packages..."
-if [[ "$USE_FAIL2BAN" == true ]]; then
+    # Install required packages
+    log "Installing required packages..."
     if ! dpkg -l ufw 2>/dev/null | grep -q "^ii"; then
         apt-get install -y -qq ufw || {
             log_error "Failed to install ufw"
@@ -898,45 +1344,42 @@ if [[ "$USE_FAIL2BAN" == true ]]; then
     else
         log_info "ufw already installed"
     fi
-    if ! dpkg -l fail2ban 2>/dev/null | grep -q "^ii"; then
-        apt-get install -y -qq fail2ban || {
-            log_error "Failed to install fail2ban"
-            exit 1
-        }
-    else
-        log_info "fail2ban already installed"
-    fi
-else
-    if ! dpkg -l ufw 2>/dev/null | grep -q "^ii"; then
-        apt-get install -y -qq ufw || {
-            log_error "Failed to install ufw"
-            exit 1
-        }
-    else
-        log_info "ufw already installed"
+    if [[ "$USE_FAIL2BAN" == true ]]; then
+        if ! dpkg -l fail2ban 2>/dev/null | grep -q "^ii"; then
+            apt-get install -y -qq fail2ban || {
+                log_error "Failed to install fail2ban"
+                exit 1
+            }
+        else
+            log_info "fail2ban already installed"
+        fi
     fi
 fi
 
-# Apply configurations
+# ── Apply configurations ──────────────────────────────────────
+# ORDER MATTERS (C3): key in place → old port protected in UFW →
+# sshd config verified on the new port → firewall committed → cleanup.
 setup_authorized_keys
-configure_firewall
+maybe_allow_old_ssh_ports
 apply_ssh_config
+configure_firewall
 
-    # Completion banner — print BEFORE fail2ban in case it drops the connection
-    PRIMARY_IP=$(get_primary_ip)
-    echo ""
-    echo "=========================================="
-    printf "${GREEN}[%s]${NC} SSH Hardening Complete!\n" "$(date +'%Y-%m-%d %H:%M:%S')"
-    echo "=========================================="
-    echo ""
-    printf "${GREEN}SSH Port:${NC} %s\n" "$SSH_PORT"
-    printf "${GREEN}User:${NC} %s\n" "$CURRENT_USER"
-    printf "${GREEN}IP:${NC} %s\n" "$PRIMARY_IP"
-    echo ""
-    printf "${YELLOW}Connect:${NC} ssh -p %s %s@%s\n" "$SSH_PORT" "$CURRENT_USER" "$PRIMARY_IP"
-    echo ""
-    echo "Now configuring fail2ban and auto-updates..."
-    echo ""
+# Completion banner — print BEFORE fail2ban in case anything disrupts
+# the connection, so the operator always sees how to connect.
+PRIMARY_IP=$(get_primary_ip)
+echo ""
+echo "=========================================="
+printf "${GREEN}[%s]${NC} SSH Hardening Complete!\n" "$(date +'%Y-%m-%d %H:%M:%S')"
+echo "=========================================="
+echo ""
+printf "${GREEN}SSH Port:${NC} %s\n" "$SSH_PORT"
+printf "${GREEN}User:${NC} %s\n" "$CURRENT_USER"
+printf "${GREEN}IP:${NC} %s\n" "$PRIMARY_IP"
+echo ""
+printf "${YELLOW}Connect:${NC} ssh -p %s %s@%s\n" "$SSH_PORT" "$CURRENT_USER" "$PRIMARY_IP"
+echo ""
+echo "Now configuring fail2ban and auto-updates..."
+echo ""
 
 configure_fail2ban
 configure_auto_updates
@@ -953,8 +1396,6 @@ if [[ "$DRY_RUN" == true ]]; then
     exit 0
 fi
 
-PRIMARY_IP=$(get_primary_ip)
-
 echo ""
 echo "=========================================="
 log "SSH Hardening Complete!"
@@ -964,17 +1405,17 @@ printf "${GREEN}Configuration Summary:${NC}\n"
 echo "  - SSH Port: $SSH_PORT"
 echo "  - Root Login: Disabled"
 echo "  - Password Authentication: Disabled"
-echo "  - Key-based Authentication: Enabled"
+echo "  - Key-based Authentication: Enabled (user: $CURRENT_USER)"
 echo "  - TCP Forwarding: $ALLOW_TCP_FORWARDING"
-echo "  - Firewall: UFW enabled"
+echo "  - Firewall: UFW active (existing rules preserved)"
 if [[ "$USE_FAIL2BAN" == true ]]; then
-    echo "  - Intrusion Prevention: Fail2ban active (escalating bans)"
+    echo "  - Intrusion Prevention: Fail2ban enabled + reloaded (sshd jail verified)"
 else
     echo "  - Intrusion Prevention: Fail2ban skipped"
 fi
 if [[ "$ENABLE_AUTO_UPDATES" == true ]]; then
-    echo "  - Automatic Updates: Weekly at ${UPDATE_HOUR}:${UPDATE_MINUTE}"
-    echo "  - Auto Restart: Enabled (server will restart after updates)"
+    echo "  - Automatic Updates: Weekly at ${UPDATE_HOUR}:${UPDATE_MINUTE} (local maintenance only — no downloads)"
+    echo "  - Reboot: Only if /var/run/reboot-required exists (+5 min delay)"
 else
     echo "  - Automatic Updates: Not configured"
 fi
@@ -982,7 +1423,7 @@ echo ""
 printf "${YELLOW}SSH Connection Info:${NC}\n"
 echo "  ssh -p $SSH_PORT $CURRENT_USER@$PRIMARY_IP"
 echo ""
-printf "${GREEN}Your public key has been added to authorized_keys.${NC}\n"
+printf "${GREEN}Your public key has been added to authorized_keys for '$CURRENT_USER'.${NC}\n"
 echo ""
 printf "${YELLOW}Backup Location:${NC}\n"
 echo "  $BACKUP_DIR"
@@ -991,10 +1432,6 @@ printf "${YELLOW}Log File:${NC}\n"
 echo "  $LOG_FILE"
 echo ""
 
-# Note: fail2ban config has been written to disk and the service is enabled.
-# Changes will be picked up on next reboot. We skip reload here because
-# restarting fail2ban manipulates iptables chains and can sever SSH sessions.
-
 printf "${RED}==========================================${NC}\n"
 printf "${RED}              IMPORTANT!${NC}\n"
 printf "${RED}==========================================${NC}\n\n"
@@ -1002,7 +1439,7 @@ printf "${YELLOW}1. DO NOT close this session until you've tested the new connec
 echo "   Open a new terminal/SSH window and test connecting with:"
 printf "   ${GREEN}ssh -p $SSH_PORT $CURRENT_USER@$PRIMARY_IP${NC}\n\n"
 printf "${YELLOW}2. Password authentication is now DISABLED${NC}\n"
-echo "   You MUST use your SSH key to connect"
+echo "   You MUST use your SSH key to connect as '$CURRENT_USER'"
 echo ""
 printf "${YELLOW}3. Keep your private key safe${NC}\n"
 echo "   There is no password fallback!"
