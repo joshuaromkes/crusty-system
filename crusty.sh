@@ -1033,13 +1033,22 @@ pkg_installed() {
     dpkg-query -W -f='${Status}' "$1" 2>/dev/null | grep -q "ok installed"
 }
 
+# §7.5: guard for ANY unattended apt call crusty makes (headless flag-mode
+# qualifies) — never prompt, never open a conffile merge editor.
+apt_guard() {
+    DEBIAN_FRONTEND=noninteractive apt-get \
+        -o Dpkg::Options::=--force-confdef \
+        -o Dpkg::Options::=--force-confold \
+        "$@"
+}
+
 apt_install() {
-    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$@"
+    apt_guard install -y -qq "$@"
 }
 
 install_packages() {
     set_step "installing required packages"
-    if ! apt-get update -qq; then
+    if ! apt_guard update -qq; then
         die "apt-get update failed — check network/DNS"
     fi
     if ! command -v sshd &>/dev/null && ! pkg_installed openssh-server; then
@@ -1174,6 +1183,20 @@ setup_authorized_keys() {
         log_warn "Fix it: chmod go-w $user_home"
     fi
 
+    # LOW-4: refuse symlink traversal — cp/chown -R/chmod below would
+    # follow a symlinked .ssh or authorized_keys and mutate its target.
+    if [[ -L "$ssh_dir" ]]; then
+        die "$ssh_dir is a symlink — refusing to install keys through it"
+    fi
+    if [[ -L "$auth_keys_file" ]]; then
+        die "$auth_keys_file is a symlink — refusing (chown/chmod would follow it)"
+    fi
+
+    # INFO: umask 077 around the temp write — no 0644 window on the
+    # in-progress authorized_keys copy.
+    local saved_umask
+    saved_umask="$(umask)"
+    umask 077
     mkdir -p "$ssh_dir"
     chmod 700 "$ssh_dir"
 
@@ -1196,6 +1219,7 @@ setup_authorized_keys() {
     chown -R "$TARGET_USER:" "$ssh_dir"
     chmod 700 "$ssh_dir"
     chmod 600 "$auth_keys_file"
+    umask "$saved_umask"
 
     # C1: verify the key actually landed BEFORE any auth restriction is applied
     if ! grep -qF "$key_line" "$auth_keys_file"; then
@@ -1292,19 +1316,27 @@ rollback_ssh_config() {
 # C3: verify sshd actually has a listener on the given port
 verify_ssh_listener() {
     local port="$1"
+    # LOW-3: a missing ss/netstat must NEVER soft-pass — a verification
+    # that silently succeeds with no check is a lockout risk (C2). Try to
+    # obtain iproute2 first; if that fails, report verification failure.
+    if ! command -v ss &>/dev/null && ! command -v netstat &>/dev/null; then
+        log_warn "Neither ss nor netstat available — attempting to install iproute2"
+        apt_install iproute2 2>/dev/null || true
+    fi
+    if ! command -v ss &>/dev/null && ! command -v netstat &>/dev/null; then
+        log_warn "No socket-listing tool available — listener verification FAILED (not a pass)"
+        return 1
+    fi
     local tries=15 i
     for ((i = 1; i <= tries; i++)); do
         if command -v ss &>/dev/null; then
             if ss -tln 2>/dev/null | grep -q ":${port}[[:space:]]"; then
                 return 0
             fi
-        elif command -v netstat &>/dev/null; then
+        else
             if netstat -tln 2>/dev/null | grep -q ":${port}[[:space:]]"; then
                 return 0
             fi
-        else
-            log_warn "Neither ss nor netstat available — cannot verify listener"
-            return 0
         fi
         sleep 1
     done
@@ -1489,7 +1521,7 @@ configure_firewall() {
     # M6: no 'ufw --force reset' — never destroy the operator's existing rules.
     # Idempotently make sure the new SSH port is allowed.
     if ! ufw status | awk -v rule="$SSH_PORT/tcp" '$1 == rule' | grep -q .; then
-        ufw allow "$SSH_PORT"/tcp comment 'SSH' >/dev/null
+        ufw allow "$SSH_PORT"/tcp comment 'crusty-ssh-port' >/dev/null
         CHANGES=$((CHANGES + 1))
         log "allowed $SSH_PORT/tcp"
     else
@@ -1644,7 +1676,7 @@ EOF
 remove_old_docker() {
     if dpkg -l 2>/dev/null | grep -qE '^ii\s+(docker\.io|docker-compose|docker-compose-v2|docker-doc|podman-docker)\s'; then
         log "removing old/conflicting Docker packages"
-        apt-get remove -y -qq docker.io docker-compose docker-compose-v2 docker-doc podman-docker 2>/dev/null || true
+        apt_guard remove -y -qq docker.io docker-compose docker-compose-v2 docker-doc podman-docker 2>/dev/null || true
         CHANGES=$((CHANGES + 1))
     fi
 }
@@ -1659,7 +1691,7 @@ install_docker_repo() {
         return 0
     fi
     log "installing Docker Engine from the official repository"
-    apt-get install -y -qq ca-certificates curl >/dev/null || return 1
+    apt_guard install -y -qq ca-certificates curl >/dev/null || return 1
     install -m 0755 -d /etc/apt/keyrings
     if [[ ! -f /etc/apt/keyrings/docker.asc ]]; then
         curl -fsSL "https://download.docker.com/linux/${ID}/gpg" -o /etc/apt/keyrings/docker.asc || return 1
@@ -1671,8 +1703,8 @@ install_docker_repo() {
     if ! grep -qF "$repo_entry" /etc/apt/sources.list.d/docker.list 2>/dev/null; then
         printf '%s\n' "$repo_entry" > /etc/apt/sources.list.d/docker.list
     fi
-    apt-get update -qq || return 1
-    apt-get install -y -qq docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin || return 1
+    apt_guard update -qq || return 1
+    apt_guard install -y -qq docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin || return 1
     if ! systemctl enable -q --now docker; then
         log_warn "docker service failed to enable/start in this environment ($ENV_CLASS)"
         return 1
@@ -1984,7 +2016,7 @@ uninstall_plan() {
     echo "  - $STATE_FILE (state file)"
     echo "  - $JAIL_LOCAL (only if it carries the crusty marker; backup restored if present)"
     if [[ -n "$u_port" ]]; then
-        echo "  - UFW rule 'allow $u_port/tcp' (if present; UFW itself is left as-is)"
+        echo "  - UFW rule 'allow $u_port/tcp' (only if it carries the crusty marker comment) + any temporary crusty-ssh-transition rules"
     fi
     echo "  - sshd_config: restore the OLDEST backup under ${BACKUP_ROOT}* (the pre-crusty original) + restart sshd"
     if [[ "$u_sudo" == 1 && -n "$u_target" ]]; then
@@ -2047,13 +2079,21 @@ do_uninstall() {
         log "removed crusty jail.local"
     fi
 
-    # 3. UFW rule for the crusty SSH port (UFW itself untouched)
-    if [[ -n "$u_port" ]] && command -v ufw &>/dev/null && ufw status 2>/dev/null | grep -q "Status: active"; then
-        if ufw delete allow "$u_port"/tcp >/dev/null 2>&1; then
-            log "removed UFW rule for $u_port/tcp"
-        else
-            log_note "no UFW rule for $u_port/tcp (already gone)"
-        fi
+    # 3. UFW rules crusty added — the SSH port rule (only when crusty added
+    # it, identified by its 'crusty-ssh-port' marker comment) and any
+    # temporary old-port transition rules ('crusty-ssh-transition') left
+    # behind by an aborted run (C3). Rules without a crusty marker were
+    # there before crusty and are left alone.
+    if command -v ufw &>/dev/null && ufw status 2>/dev/null | grep -q "Status: active"; then
+        local crusty_ports p
+        crusty_ports=$(ufw status 2>/dev/null | grep -F "crusty-ssh" | awk '{print $1}' | sed 's|/tcp$||' | sort -u)
+        for p in $crusty_ports; do
+            if ufw delete allow "$p/tcp" >/dev/null 2>&1; then
+                log "removed crusty-added UFW rule for $p/tcp"
+            else
+                log_note "no UFW rule for $p/tcp (already gone)"
+            fi
+        done
     fi
 
     # 4. restore the OLDEST sshd backup — that is the config as it was
@@ -2095,13 +2135,15 @@ do_uninstall() {
     # (guards against someone recreating the same name later; amendment Part 2)
     if [[ "$u_created" == 1 && -n "$u_target" ]]; then
         if getent passwd "$u_target" >/dev/null 2>&1; then
-            if [[ -z "$u_uid" || "$(id -u "$u_target")" == "$u_uid" ]]; then
+            if [[ -n "$u_uid" && "$(id -u "$u_target")" == "$u_uid" ]]; then
                 if userdel -r "$u_target" 2>/dev/null; then
                     log "removed user '$u_target' and its home (created by crusty, uid matched)"
                 else
                     userdel "$u_target" >/dev/null 2>&1 || true
                     log_warn "userdel -r failed (running processes?) — user removed without home cleanup or kept; check manually"
                 fi
+            elif [[ -z "$u_uid" ]]; then
+                log_warn "'$u_target' was created by crusty but no uid was recorded — NOT removing (amendment Part 2)"
             else
                 log_warn "'$u_target' exists but its uid ($(id -u "$u_target")) != recorded ($u_uid) — NOT removing (recreated by someone else)"
             fi
