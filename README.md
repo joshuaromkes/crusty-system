@@ -1,221 +1,115 @@
-# Crusty System
+# crusty
 
 > **Note:** This codebase was developed with AI assistance. Review and test thoroughly before deploying in production environments.
 
-> Automated configuration and hardening scripts for Linux.
+Single-file Debian/Ubuntu server hardening wizard. One file, no downloads at runtime, no module scripts — `crusty.sh` is the whole product.
 
-## Overview
+## What it does
 
-Crusty System is a collection of quick-start scripts designed to automatically configure systems and services with a single command. When a new system is provisioned, simply execute the appropriate script to set up everything with security best practices.
+Interactive-first wizard (whiptail, plain-read fallback, headless flags) that:
 
-**Update model (important):** the weekly cron runs LOCAL maintenance only — it never downloads anything from the network. Crusty scripts themselves are updated by re-running the setup one-liner: each downloaded sub-script is verified against SHA-256 pins embedded in `setup.sh` before it is used, and cached copies that no longer match their pin are automatically re-downloaded and re-verified. Re-running the one-liner on an already-configured box heals it to the current repo state — no per-box visits required.
+1. Creates or reuses a dedicated non-root admin user (never root — a root-only key behind `PermitRootLogin no` is a guaranteed lockout)
+2. Installs your SSH public key for that user, **verified before any auth restriction is applied**
+3. Hardens sshd: custom port, password auth off, root login off, modern ciphers, pre-flight `sshd -t` + atomic swap + rollback on failure
+4. Enables UFW (existing rules preserved — never reset), keeping the old SSH port reachable during port transitions
+5. fail2ban sshd jail with the **systemd backend** (no logpath, works on fresh Debian 12 / Ubuntu 24.04), reloaded — never restarted
+6. Optional Docker Engine from the official repo with a hardened, **merged** daemon.json
+7. Weekly LOCAL maintenance cron: apt update/upgrade/autoremove/autoclean with conffile-safe options, serialized by flock, reboot only when the OS flags it. **It never downloads anything** — updates to crusty itself are re-running the script.
 
-## Available Scripts
+State lives in `/etc/crusty.conf` (0644, no secrets). Re-running crusty **converges**: a second run with the same answers applies zero changes, and it also heals relics from the old V1 multi-script layout (legacy cron files, `/opt/crusty-system`).
 
-| Script | Description | Status |
-|--------|-------------|--------|
-| `setup.sh` | **Master Debian/Ubuntu setup** — SSH hardening, Docker, auto-updates | Ready |
-| `scripts/ubuntu/ssh-hardener.sh` | SSH hardening (lockout-safe) + UFW + fail2ban for Debian/Ubuntu | Ready |
-| `scripts/ubuntu/docker-setup.sh` | Docker Engine + Compose with security best practices | Ready |
-| `scripts/ubuntu/auto-update.sh` | Weekly LOCAL maintenance cron for Debian/Ubuntu | Ready |
-| `scripts/ubuntu/maintenance.sh` | The local maintenance script the cron runs (apt + conditional reboot) | Ready |
-| `scripts/alpine/setup.sh` | Full system setup for Alpine Linux (packages, SSH, UFW, fail2ban, auto-updates) | Ready |
-
-## Quick Start
-
-### Debian/Ubuntu — Master Setup (Recommended)
-
-One-liner that does everything:
-```bash
-curl -sSL https://raw.githubusercontent.com/joshuaromkes/crusty-system/main/setup.sh | sudo bash -s -- \
-  --ssh-key "$(cat ~/.ssh/id_ed25519.pub)" \
-  --ssh-user "$USER" \
-  --docker --docker-user "$USER"
-```
-
-> **Tip:** When piping via `curl`, stdin is not a terminal, so you MUST pass `--ssh-key`. If you run the script directly on the machine (not piped), it will prompt you interactively.
-
-> **Root-lockout guard:** the key is NEVER installed for `root` — the hardener sets `PermitRootLogin no`, so a root-installed key would lock you out. Run via `sudo` from your admin user (auto-detected via `SUDO_USER`), or pass `--ssh-user USER` explicitly. If no non-root target can be resolved, the script refuses with guidance instead of locking you out.
-
-**What it does:**
-1. **SSH Hardening** — Changes SSH port, disables password auth, disables root login, installs your key for a non-root user, configures UFW firewall (existing rules preserved), installs fail2ban and RELOADS it (never restarts — restarts historically severed live SSH sessions)
-2. **Docker** — Installs Docker Engine from official repo + Compose plugin + hardened daemon (log rotation, no-new-privileges, live-restore; existing `daemon.json` keys are merged, not destroyed)
-3. **Auto Updates** — Weekly LOCAL maintenance (apt upgrade, autoremove, autoclean) with conditional reboot (only if `/var/run/reboot-required` exists, +5 min delay). The cron never downloads anything; every step is logged to `/var/log/crusty-maintenance.log`
-4. **Script updates** — handled by re-running the one-liner (SHA-256 verified), NOT by cron
-
-**Flags:**
-```
---ssh-key "KEY"              SSH public key for authorized_keys (required unless interactive)
---ssh-user USER              Non-root user to install the key for (default: SUDO_USER;
-                             refuses instead of installing for root)
---ssh-port PORT              SSH port (default: 58432; 22 is supported for NAT'd/LXC-style
-                             hosts behind a parent firewall)
---allow-tcp-forwarding MODE  "no" (default), "local", or "yes"
---docker                     Install Docker Engine + Compose
---docker-user USER           Add USER to docker group
---no-fail2ban                Skip fail2ban
---no-auto-updates            Skip weekly maintenance
---update-time HH:MM          Maintenance time (default: 02:00)
---dry-run                    Preview without applying
-```
-
-Minimal setup (SSH hardening only):
-```bash
-curl -sSL https://raw.githubusercontent.com/joshuaromkes/crusty-system/main/setup.sh | sudo bash -s -- \
-  --ssh-key "$(cat key.pub)" --ssh-user josh --no-fail2ban --no-auto-updates
-```
-
-LXC-style host that keeps port 22 (parent firewall handles filtering):
-```bash
-curl -sSL https://raw.githubusercontent.com/joshuaromkes/crusty-system/main/setup.sh | sudo bash -s -- \
-  --ssh-key "$(cat key.pub)" --ssh-user josh --ssh-port 22
-```
-
-### Supply-chain verification
-
-`setup.sh` embeds a SHA-256 pin table at the top of the file. Every sub-script it downloads is verified against its pin before use; a mismatch (tampered or stale file) is a hard error. If you edit any sub-script, regenerate the pins (`sha256sum scripts/ubuntu/*.sh`) and paste them into the table before committing — otherwise the one-liner will refuse to download the changed script.
-
----
-
-### Debian/Ubuntu — Individual Scripts
-
-#### SSH Hardener
+## Install (read what you run — two steps)
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/joshuaromkes/crusty-system/main/scripts/ubuntu/ssh-hardener.sh | sudo bash
+curl -fsSLo crusty.sh https://raw.githubusercontent.com/joshuaromkes/crusty-system/main/crusty.sh
+less crusty.sh
+sudo bash crusty.sh
 ```
 
-**What it does:**
-- Changes SSH port to 58432 (22 supported for LXC-style hosts)
-- Disables password authentication (key-only) and root login
-- Installs your key for a non-root user (`--user`, or `SUDO_USER`; never root)
-- Pre-flights the new sshd_config with `sshd -t` before touching the live config, replaces it atomically, and rolls back + exits on any restart/listener failure
-- Verifies sshd is listening on the new port BEFORE enabling the firewall; the old port is temporarily allowed during the transition
-- Moves conflicting `/etc/ssh/sshd_config.d/` drop-ins to a backup dir (cloud-init may recreate them on boot)
-- Configures UFW without resetting existing rules
-- Installs fail2ban and activates it with `fail2ban-client reload` (never `restart` — restarts historically severed SSH sessions), then verifies with `fail2ban-client status sshd`
+`curl | sudo bash` also works, but you can't read the script first — the two-step form is recommended. Note: a piped script cannot self-elevate; use the two-step form when running as a non-root user.
 
-Non-interactive mode:
-```bash
-curl -sSL https://raw.githubusercontent.com/joshuaromkes/crusty-system/main/scripts/ubuntu/ssh-hardener.sh | sudo bash -s -- \
-  --port 58432 --key "$(cat ~/.ssh/id_ed25519.pub)" --user josh --no-fail2ban --no-auto-updates
+## Wizard flow
+
+Preflight (OS + environment detection) → collect everything up front (≤8 prompts: admin user, password ×2, sudo, SSH key, port, modules, docker user, maintenance time) → plan display → final confirm → strictly non-interactive apply with `[+]` progress lines → summary with the connect string.
+
+Log: `/var/log/crusty-install.log`.
+
+## Flags
+
+A flag pre-fills its answer and skips its prompt. `--yes` takes defaults for the rest. **Headless runs (no TTY — `curl | bash`, CI) require `--user`, `--ssh-key` and `--yes`;** the account stays password-locked (key-only) by design in headless mode — there is no `--password` flag because argv leaks through `ps` and shell history.
+
+```
+--user NAME              admin user (refuses root; created if absent, reused if present)
+--ssh-key KEY            public key (paste or path to a .pub file), validated
+--port N                 SSH port, default 22
+--docker / --no-docker   Docker module (default: no)
+--docker-user NAME       docker group member (default: the admin user; implies --docker)
+--fail2ban / --no-fail2ban   default: yes
+--maintenance / --no-maintenance   default: yes
+--time HH:MM             maintenance time, default 02:00 Sunday
+--tcp-forwarding no|local|yes    flag only (no wizard prompt), default no
+--dry-run                show the plan, zero changes
+--yes                    skip the final confirmation
+--uninstall              remove exactly what crusty owns (shows the plan first)
+--help
 ```
 
----
+## Environment matrix
 
-#### Docker Setup
+| Environment | Detection | Behavior |
+|---|---|---|
+| PVE **host** | `/etc/pve/.node_name` or `pveversion` | **Hard refusal, before any mutation** — hardening breaks PVE cluster root SSH. See [pve.proxmox.com/wiki/Security](https://pve.proxmox.com/wiki/Security) |
+| LXC (privileged / unprivileged) | cgroup/container markers + `/proc/self/uid_map` | Fully supported. UFW/fail2ban are **attempted** and fail soft if the container lacks the capability: they roll back, warn, and the skip is recorded in `/etc/crusty.conf` — never fatal. sudo prompt defaults to no (the PVE console is the admin path) |
+| PVE VM | `systemd-detect-virt` (kvm/qemu/...) | Fully supported |
+| Bare metal | `systemd-detect-virt` none | Fully supported |
 
-```bash
-curl -sSL https://raw.githubusercontent.com/joshuaromkes/crusty-system/main/scripts/ubuntu/docker-setup.sh | sudo bash -s -- --user $USER --prune-cron
-```
+LXC notes:
 
-**What it does:**
-- Installs Docker Engine from the official Docker repository (not apt default)
-- Installs Docker Compose plugin (`docker compose`)
-- Configures daemon with security best practices:
-  - Log rotation: 10MB max, 3 files
-  - `no-new-privileges: true`
-  - `live-restore: true`
-  - `userland-proxy: false`
-  - Existing `daemon.json` customizations are MERGED (jq) or backed up before any overwrite
-- Optional: add user to docker group (`--user USER`)
-- Optional: weekly image prune cron (`--prune-cron`) — `docker image prune -af --filter "until=168h"`: images only, volumes are NEVER pruned, exit code logged
+- **Docker in LXC** requires `features: nesting=1` (+ `keyctl=1` for unprivileged) in the pct config — set on the PVE host side, crusty can't fix it and prints the requirement.
+- **A container firewall protects the container, not the host.** The PVE/datacenter boundary is the real firewall; crusty prints this caveat on every container run.
+- `sudo` defaults to no inside containers (PVE console is the admin path); pass it interactively or rely on env defaults — there is deliberately no `--sudo` flag.
 
-> **WARNING — Docker bypasses UFW:** any port published with `-p` (e.g. `-p 8080:80`) is reachable from the network even with `ufw default deny incoming`. Docker inserts its own iptables rules that run before UFW. Mitigate by publishing to loopback (`-p 127.0.0.1:8080:80` + reverse proxy), restricting via the `DOCKER-USER` chain, or filtering upstream. "Firewall: UFW enabled" does NOT close published Docker ports.
+## Weekly maintenance cron
 
----
+`/etc/cron.d/crusty-maintenance` (0644) runs every Sunday at the configured time:
 
-#### Auto Update
+- `flock`-serialized, all output appended to `/var/log/crusty-maintenance.log`
+- `DEBIAN_FRONTEND=noninteractive` + `--force-confdef/--force-confold` so a conffile prompt can never stall the headless run
+- Sequential steps (an update failure still attempts upgrade/autoremove/autoclean)
+- Reboots only when `/var/run/reboot-required` exists, with a 5-minute grace warning
+- **Never downloads anything** — no network fetches in cron, ever
 
-```bash
-curl -sSL https://raw.githubusercontent.com/joshuaromkes/crusty-system/main/scripts/ubuntu/auto-update.sh | sudo bash
-```
+> `%` WARNING: cron turns the first unescaped `%` into a newline and truncates the command (man 5 crontab). The crusty cron line is deliberately `%`-free (it uses `date -Is`). CI guards against regressions — never "fix" the date format to `+%F` style.
 
-Interactive mode prompts for maintenance time. Non-interactive:
-```bash
-curl -sSL https://raw.githubusercontent.com/joshuaromkes/crusty-system/main/scripts/ubuntu/auto-update.sh | sudo bash -s -- install --non-interactive --time 03:30
-```
+## Docker + UFW truth
 
-**What it does:**
-- Installs the LOCAL maintenance script to `/opt/crusty-system/scripts/ubuntu/maintenance.sh`
-- Creates a weekly cron job that runs ONLY that local script — no downloads, no one-line mega-command
-- Maintenance: `apt update`, `apt upgrade` (never full-upgrade), `autoremove --purge`, `autoclean`
-- Conditional reboot: only if `/var/run/reboot-required` exists, with 5-minute delay
-- Every step and its exit code is logged to `/var/log/crusty-maintenance.log`
-- Re-running `install` rewrites the cron, replacing any legacy network-fetching version
+Any port published with `-p` is reachable from the network **even with `ufw default deny incoming`** — Docker's iptables rules run before UFW's. Mitigate by publishing to loopback (`-p 127.0.0.1:8080:80`) or filtering via the DOCKER-USER chain.
 
-Other commands:
-```bash
-sudo bash auto-update.sh status      # Show current config
-sudo bash auto-update.sh uninstall    # Remove cron + maintenance script
-sudo bash auto-update.sh run-now     # Trigger maintenance immediately
-```
+## Docker image pruning (manual, if you want it)
 
----
+Crusty deliberately ships no prune cron (minimal-cron ethos). If you reintroduce one: prune **images only** — `docker image prune -af --filter "until=168h"`. NEVER `docker system prune` and NEVER `--volumes` — volume deletion has destroyed data of stopped-but-kept stacks.
 
-### Alpine Linux
-
-Full system setup — installs common packages, configures SSH hardening,
-UFW firewall, fail2ban, and automatic daily updates.
+## Uninstall
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/joshuaromkes/crusty-system/main/scripts/alpine/setup.sh | sh
+sudo bash crusty.sh --uninstall
 ```
 
-The script walks you through:
-1. **Additional packages** — choose from nano, bash, curl, htop, tmux, git, rsyslog, chrony, neofetch
-2. **SSH server** — install OpenSSH, configure port (22 allowed for LXC-style hosts), add your public key for a non-root user (refuses root — same lockout guard as Debian/Ubuntu), apply hardening with `sshd -t` pre-flight + rollback
-3. **UFW firewall** — deny incoming, allow SSH, enable at boot
-4. **Fail2ban** — escalating bans for brute force protection
-5. **Automatic updates** — daily local `apk update && apk upgrade` via the local maintenance script; the box reboots ONLY when packages actually changed (no more unconditional daily reboots)
+Shows the removal plan and asks for confirmation (or `--yes`). Removes exactly what crusty owns: the maintenance cron, the state file, the fail2ban jail (only if crusty wrote it), crusty's UFW port rule, restores the pre-crusty sshd_config from the oldest backup, removes group memberships crusty added, and deletes the admin user + home **only if crusty created it and the uid still matches**. Pre-existing users are never touched. V1 relics are cleaned up too. Backups under `/root/crusty-backups-*` are kept.
 
-**Note:** Alpine uses `doas` by default (not `sudo`). The script detects which is available.
+## Development
 
----
+```bash
+bash -n crusty.sh          # syntax check
+shellcheck crusty.sh       # must be clean (CI enforces both)
+```
 
-## Requirements
-
-- Root or doas/sudo privileges
-- Internet connection for package installation (not for the maintenance cron — that runs local-only)
-
-## Security Model
-
-1. **No network in cron.** The weekly/daily crons run local maintenance only. Script updates happen when you re-run the one-liner, verified against embedded SHA-256 pins.
-2. **Lockout-safety first.** Root-key installs are refused; sshd changes are pre-flighted, atomic, verified, and rolled back on failure; the old SSH port stays reachable until the new one is confirmed live; fail2ban is reloaded, never restarted.
-3. **Honest perimeter.** UFW manages host ports; Docker-published ports bypass UFW (see the Docker section). The completion output says so explicitly.
-4. **Visible failures.** Maintenance logs every step's exit code to `/var/log/crusty-maintenance.log`.
-
-## Security Notice
-
-These scripts are designed to enhance server security. However, security is an ongoing process. After running these scripts:
-
-1. Keep your system updated regularly
-2. Monitor logs for suspicious activity
-3. Review and rotate certificates periodically
-4. Follow the principle of least privilege for user access
+Conventions: `set -Eeuo pipefail` from line 1; rigid section order (primitives → arg parse → preflight → ask → plan → apply → verify); functions < 60 lines; no bare `read` (all prompts are TTY-gated and read `/dev/tty`); ASCII-only output markers; no secrets in argv, logs, or the state file.
 
 ## Contributing
 
-### Reporting Issues
-
-Found a bug or have a feature request? Open an issue on GitHub:
-https://github.com/joshuaromkes/crusty-system/issues
-
-When reporting bugs, include:
-- Which script you were running
-- Operating system and version (`cat /etc/os-release`)
-- Complete error output
-- Steps to reproduce
-
-### Pull Requests
-
-Pull requests are welcome. Please:
-1. Test your changes on a fresh Debian/Ubuntu VM
-2. Run `bash -n` on all modified scripts (`sh -n` for the Alpine script)
-3. Regenerate the SHA-256 pin table in `setup.sh` if you touched any sub-script
-4. Keep the idempotent/safe-first design philosophy
-5. Follow existing code style (color-coded output, `set -euo pipefail`, clear comments)
+PRs welcome: test on a fresh Debian/Ubuntu VM (or a disposable LXC), keep `bash -n` + `shellcheck` clean, never weaken the tagged lockout-safety patterns (C1/C2/C3/H1/H4/H5/H10/M3/M5/M6/M7/G6), and keep the cron line `%`-free.
 
 ## License
 
-This project is licensed under the MIT License
+MIT

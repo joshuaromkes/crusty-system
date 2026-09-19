@@ -1,0 +1,27 @@
+name: shellcheck
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install shellcheck
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+      - name: bash -n syntax check
+        run: bash -n crusty.sh
+      - name: shellcheck
+        run: shellcheck crusty.sh
+      - name: cron %-free guard
+        # CRITICAL: a % in the cron command line truncates it at the first %
+        # (man 5 crontab) and silently kills the whole maintenance chain.
+        # Anchor on `root flock` (the actual cron command line) — grepping
+        # the whole file would false-positive on printf '%s' format strings.
+        run: |
+          if grep 'root flock' crusty.sh | grep '%'; then
+            echo "FAIL: % found in the maintenance cron command line in crusty.sh"
+            exit 1
+          fi

@@ -60,3 +60,6 @@ ENV/
 
 # Shell script testing
 .bash_history
+
+# Nested git worktree checkouts (kanban workspaces) — never commit these
+/.worktrees/
