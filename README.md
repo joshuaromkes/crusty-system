@@ -14,9 +14,9 @@ Interactive-first wizard (whiptail, plain-read fallback, headless flags) that:
 4. Enables UFW (existing rules preserved — never reset), keeping the old SSH port reachable during port transitions
 5. fail2ban sshd jail with the **systemd backend** (no logpath, works on fresh Debian 12 / Ubuntu 24.04), reloaded — never restarted
 6. Optional Docker Engine from the official repo with a hardened, **merged** daemon.json
-7. Weekly LOCAL maintenance cron: apt update/upgrade/autoremove/autoclean with conffile-safe options, serialized by flock, reboot only when the OS flags it. **It never downloads anything** — updates to crusty itself are re-running the script.
+7. Optional LOCAL maintenance scheduler (a systemd timer): apt update/upgrade/autoremove/autoclean with conffile-safe options, serialized by flock, reboot only when the OS flags it — on a daily/weekly/monthly/every-N-days schedule you choose. Optional unattended-upgrades wiring for automatic security updates. **It never downloads anything** — updates to crusty itself are re-running the script.
 
-State lives in `/etc/crusty.conf` (0644, no secrets). Re-running crusty **converges**: a second run with the same answers applies zero changes, and it also heals relics from the old V1 multi-script layout (legacy cron files, `/opt/crusty-system`).
+State lives in `/etc/crusty.conf` (0644, no secrets). Re-running crusty **converges**: a second run with the same answers applies zero changes. Every run first sweeps stale crusty schedulers left by older crusty versions (v1 cron relics included) — and only crusty-signed entries; unknown crons are reported, never touched.
 
 ## Install (read what you run — two steps)
 
@@ -30,7 +30,7 @@ sudo bash crusty.sh
 
 ## Wizard flow
 
-Preflight (OS + environment detection) → collect everything up front (≤9 prompts: admin user, password ×2, sudo, SSH key, port, firewall, modules, docker user, maintenance time) → plan display → final confirm → strictly non-interactive apply with `[+]` progress lines → summary with the connect string.
+Preflight (OS + environment detection) → collect everything up front (≤9 prompts: admin user, password ×2, sudo, SSH key, port, firewall, modules, maintenance schedule, docker user) → plan display (schedule, auto-update/reboot answers, plus the stale-scheduler sweep list) → final confirm → strictly non-interactive apply with `[+]` progress lines → summary with the connect string.
 
 Log: `/var/log/crusty-install.log`.
 
@@ -54,7 +54,14 @@ A flag pre-fills its answer and skips its prompt. `--yes` takes defaults for the
 --docker-user NAME       docker group member (default: the admin user; implies --docker)
 --fail2ban / --no-fail2ban   default: yes
 --maintenance / --no-maintenance   default: yes
---time HH:MM             maintenance time, default 02:00 Sunday
+--time HH:MM             maintenance clock (24h), default 02:00
+--maint-schedule daily|weekly|monthly|n-days   default: weekly
+--maint-weekday DAY      weekly preset (Mon..Sun), default Sun
+--maint-mday N           monthly preset (1-28 — 29+ has no monthly slot)
+--maint-n-days N         n-days preset (1-365)
+--auto-update / --no-auto-update   install unattended-upgrades (default: no)
+--auto-reboot / --no-auto-reboot   reboot when upgrades require it (default: no)
+--reboot-time HH:MM      unattended-upgrades reboot clock, default 02:00
 --tcp-forwarding no|local|yes    flag only (no wizard prompt), default no
 --dry-run                show the plan, zero changes
 --yes                    skip the final confirmation
@@ -77,17 +84,30 @@ LXC notes:
 - **A container firewall protects the container, not the host.** The PVE/datacenter boundary is the real firewall; crusty prints this caveat on every container run.
 - `sudo` defaults to no inside containers (PVE console is the admin path); pass it interactively or with `--sudo` / `--no-sudo`.
 
-## Weekly maintenance cron
+## Maintenance scheduling (systemd timer)
 
-`/etc/cron.d/crusty-maintenance` (0644) runs every Sunday at the configured time:
+One scheduler backend — a **systemd timer** (plain cron has no "every N days" field, and every supported target has systemd). The wizard asks for the schedule after the maintenance module is enabled:
 
-- `flock`-serialized, all output appended to `/var/log/crusty-maintenance.log`
-- `DEBIAN_FRONTEND=noninteractive` + `--force-confdef/--force-confold` so a conffile prompt can never stall the headless run
-- Sequential steps (an update failure still attempts upgrade/autoremove/autoclean)
-- Reboots only when `/var/run/reboot-required` exists, with a 5-minute grace warning
-- **Never downloads anything** — no network fetches in cron, ever
+| Preset | OnCalendar | Notes |
+|---|---|---|
+| daily | `*-*-* HH:MM` | every day at the chosen time |
+| weekly | `DAY *-*-* HH:MM` | weekday prompt (Mon..Sun) |
+| monthly | `*-*-N HH:MM` | day 1-28 (29+ has no monthly slot) |
+| n-days | `*-*-* HH:MM` daily + throttle | the service skips until N days (1-365) have passed since the last run (`/var/lib/crusty/maintenance.state`) |
 
-> `%` WARNING: cron turns the first unescaped `%` into a newline and truncates the command (man 5 crontab). The crusty cron line is deliberately `%`-free (it uses `date -Is`). CI guards against regressions — never "fix" the date format to `+%F` style.
+Installed files (all stamped `# crusty-maintenance v2` so future sweeps are self-identifying):
+
+- `/etc/systemd/system/crusty-maintenance.timer` (0644) — `Persistent=true`, so a missed run while powered off is caught on the next boot
+- `/etc/systemd/system/crusty-maintenance.service` (0644) — oneshot, `Nice=10`, `IOSchedulingClass=idle`
+- `/usr/local/sbin/crusty-maintenance` (0755) — reads `/etc/crusty.conf`; `flock`-serialized; all output appended to `/var/log/crusty-maintenance.log`; `DEBIAN_FRONTEND=noninteractive` + `--force-confdef/--force-confold` so a conffile prompt can never stall the headless run; reboots (via a scheduled `shutdown -r HH:MM`) only when `/var/run/reboot-required` exists AND you answered yes to auto-reboot
+
+With `--auto-update`, crusty installs `unattended-upgrades` and converges `/etc/apt/apt.conf.d/20auto-upgrades` + `50unattended-upgrades` (security origins; `Automatic-Reboot`/`Automatic-Reboot-Time` from your answers). An existing **unmanaged** `50unattended-upgrades` is never clobbered. The wizard never runs an upgrade itself — the distro timers and the maintenance service own execution.
+
+### Stale scheduler sweep
+
+Before anything is installed, every scheduler location is scanned and every crusty-signed entry from ANY older crusty version is removed: root crontab lines containing `crusty` (v1's `crusty-update`/`crusty updater`/`crusty-maintenance` in all forms, continuation lines included), `/etc/cron.d/*crusty*`, `/etc/cron.{daily,weekly,monthly}/crusty*`, stale `crusty*.timer|crusty*.service` units (disabled + deleted, enable symlinks too). The hard guard: **nothing without a `crusty` signature is ever deleted** — unrelated crons are listed in the plan as "found, not touched", report-only. Unrelated crontab lines are preserved byte-for-byte.
+
+> `%` WARNING: cron turns the first unescaped `%` into a newline and truncates the command (man 5 crontab). Crusty's scheduler is systemd now, but the hygiene rule carries over: generated unit lines are deliberately `%`-free (a literal `%` is a specifier escape in unit files). CI guards against regressions.
 
 ## Docker + UFW truth
 
@@ -103,7 +123,7 @@ Crusty deliberately ships no prune cron (minimal-cron ethos). If you reintroduce
 sudo bash crusty.sh --uninstall
 ```
 
-Shows the removal plan and asks for confirmation (or `--yes`). Removes exactly what crusty owns: the maintenance cron, the state file, the fail2ban jail (only if crusty wrote it), crusty's UFW port rule, restores the pre-crusty sshd_config from the oldest backup, removes group memberships crusty added, and deletes the admin user + home **only if crusty created it and the uid still matches**. Pre-existing users are never touched. V1 relics are cleaned up too. Backups under `/root/crusty-backups-*` are kept.
+Shows the removal plan and asks for confirmation (or `--yes`). Removes exactly what crusty owns: the maintenance timer, service and script, the state file, the fail2ban jail (only if crusty wrote it), crusty's UFW port rule, restores the pre-crusty sshd_config from the oldest backup, removes group memberships crusty added, and deletes the admin user + home **only if crusty created it and the uid still matches**. Pre-existing users are never touched. V1 relics and any stale crusty schedulers are cleaned up too. Backups under `/root/crusty-backups-*` are kept.
 
 ## Development
 
@@ -116,7 +136,7 @@ Conventions: `set -Eeuo pipefail` from line 1; rigid section order (primitives �
 
 ## Contributing
 
-PRs welcome: test on a fresh Debian/Ubuntu VM (or a disposable LXC), keep `bash -n` + `shellcheck` clean, never weaken the tagged lockout-safety patterns (C1/C2/C3/H1/H4/H5/H10/M3/M5/M6/M7/G6), and keep the cron line `%`-free.
+PRs welcome: test on a fresh Debian/Ubuntu VM (or a disposable LXC), keep `bash -n` + `shellcheck` clean, never weaken the tagged lockout-safety patterns (C1/C2/C3/H1/H4/H5/H10/M3/M5/M6/M7/G6), and keep generated unit/cron lines `%`-free.
 
 ## License
 

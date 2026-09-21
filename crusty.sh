@@ -2017,20 +2017,23 @@ classify_crontab_lines() {
     done
 }
 
-# Print the root crontab content on stdout; sets RC_SRC to the source
-# label ("file path" or "crontab(1)") — empty when there is no crontab.
+# Read the root crontab into RC_CONTENT (verbatim) and set RC_SRC to the
+# source label ("file path" or "crontab(1)") — empty when there is no
+# crontab. Sets GLOBALS directly: the sweep needs both the content and the
+# source, and command substitution would lose any assignment the function
+# makes (subshell — this bit scan_stale_crusty under set -u).
 read_root_crontab() {
-    RC_SRC=""
+    RC_SRC=""; RC_CONTENT=""
     if [[ -f "$ROOT_CRONTAB" ]]; then
         RC_SRC="$ROOT_CRONTAB"
-        cat "$ROOT_CRONTAB"
+        RC_CONTENT=$(cat "$ROOT_CRONTAB")
         return 0
     fi
     if command -v crontab >/dev/null 2>&1; then
         local c
         if c=$(crontab -u root -l 2>/dev/null); then
             RC_SRC="crontab -u root -l"
-            printf '%s\n' "$c"
+            RC_CONTENT="$c"
         fi
     fi
     return 0
@@ -2049,7 +2052,8 @@ scan_stale_crusty() {
     # a) root crontab — ANY line containing 'crusty' (v1 wrote
     #    crusty-update / crusty updater / crusty-maintenance in all forms)
     src=""
-    content=$(read_root_crontab)
+    read_root_crontab
+    content="$RC_CONTENT"
     src="$RC_SRC"
     if [[ -n "$src" ]]; then
         while IFS=$'\t' read -r kind line; do
@@ -2133,7 +2137,8 @@ sweep_stale_crusty() {
 # move. crontab(1) source: install via `crontab -u root`.
 sweep_root_crontab_apply() {
     local src="$1" content tmp kept=0 line
-    content=$(read_root_crontab)
+    read_root_crontab
+    content="$RC_CONTENT"
     if [[ -z "$RC_SRC" ]]; then
         return 0    # vanished between scan and apply — nothing to do
     fi

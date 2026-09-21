@@ -8,6 +8,11 @@
 #   6. keep-key re-run = zero changes; per-module delta idempotency
 #   7. firewall pre-flight (round-4): stack detection, rule review/remove,
 #      inbound-listener allow, no-layering warning, converged re-run reuse
+#   8. maintenance v2: OnCalendar matrix, generated unit/script hygiene
+#      (no %, marker lines, systemd-analyze verify), stale-crusty sweep
+#      fixture (crusty-signed entries only, unrelated byte-preserved),
+#      unattended-upgrades wiring + unmanaged-file guard, and the
+#      dry-run-twice zero-change convergence contract
 #
 # Pure-function tests never need root; the PTY signal test needs `script`
 # and `whiptail` (installed in CI; skipped with a note when absent).
@@ -103,6 +108,8 @@ crusty_globals() {
     FW_ALLOW_EXTRA=(); FW_REMOVE_RULES=()
     OLD_FW_STACK=""; OLD_FW_ACK=""; OLD_FW_EXTRA_ALLOW=""
     OLD_TARGET_USER=""; OLD_SUDO=""; OLD_SSH_PORT=""; OLD_SSH_KEY_FP=""; OLD_MAINT_TIME=""
+    OLD_MAINT_SCHEDULE=""; OLD_MAINT_WEEKDAY=""; OLD_MAINT_MDAY=""; OLD_MAINT_N_DAYS=""
+    OLD_AUTO_UPDATE=""; OLD_AUTO_REBOOT=""; OLD_REBOOT_TIME=""
     STATE_FILE="/etc/crusty.conf"
     CHANGES=0; KEY_MAX_LEN=4096
     CURRENT_SSH_PORTS=(22); SSH_PORT=22
@@ -111,6 +118,14 @@ crusty_globals() {
     ENABLE_DOCKER=false; ENABLE_FAIL2BAN=true; ENABLE_MAINTENANCE=true
     DOCKER_USER=""; DOCKER_RESULT=""; DOCKER_GROUP_ADDED=""
     MAINT_HOUR=02; MAINT_MINUTE=00; ALLOW_TCP_FORWARDING=no
+    MAINT_SCHEDULE=""; MAINT_WEEKDAY=""; MAINT_MDAY=""; MAINT_N_DAYS=""
+    AUTO_UPDATE=""; AUTO_REBOOT=""; REBOOT_TIME="02:00"
+    MAINT_MARKER="# crusty-maintenance v2"
+    MAINT_UNIT_TIMER="/etc/systemd/system/crusty-maintenance.timer"
+    MAINT_UNIT_SERVICE="/etc/systemd/system/crusty-maintenance.service"
+    MAINT_SCRIPT="/usr/local/sbin/crusty-maintenance"
+    MAINT_RUN_STATE="/var/lib/crusty/maintenance.state"
+    SWEEP_REMOVE=(); SWEEP_KEEP=()
     BACKUP_ROOT="/var/backups/"
     ENV_CLASS="debian"; CRUSTY_CREATED_USER=""; CRUSTY_USER_UID=""; SSH_KEY_FP=""
 }
@@ -150,7 +165,7 @@ run_wizard_case() {  # $1 = stub body applied to all nine prompts
         prompt_modules() { eval "$body"; }
         prompt_firewall() { eval "$body"; }
         prompt_docker_user() { eval "$body"; }
-        prompt_maint_time() { eval "$body"; }
+        prompt_maintenance() { eval "$body"; }
         source <("$EXTRACT" wizard)
         wizard
     )
@@ -165,7 +180,7 @@ wizard_stub9() {  # the nine return-0 prompt stubs used by the full-path cases
     prompt_modules() { return 0; }
     prompt_firewall(){ return 0; }
     prompt_docker_user() { return 0; }
-    prompt_maint_time()  { return 0; }
+    prompt_maintenance() { return 0; }
 }
 export -f wizard_stub9 2>/dev/null || true
 
@@ -793,6 +808,313 @@ if printf '%s' "$PLAN2" | grep -q 'UFW SKIPPED — existing firewalld stack kept
     ok
 else
     fail "plan display must show the firewall SKIP and the queued listener allows"
+fi
+
+# ----------------------------------------------------------------------------
+section "8. maintenance v2 (OnCalendar, generated units, stale sweep, uatt)"
+
+# Point every crusty path at a fixture root and stub the host binaries the
+# extracted functions may otherwise reach (no real systemd / crontab here).
+maint_env() {  # $1 = fixture root
+    local fx="$1"
+    MAINT_UNIT_TIMER="$fx/systemd/crusty-maintenance.timer"
+    MAINT_UNIT_SERVICE="$fx/systemd/crusty-maintenance.service"
+    MAINT_SCRIPT="$fx/bin/crusty-maintenance"
+    MAINT_RUN_STATE="$fx/lib/crusty/maintenance.state"
+    ROOT_CRONTAB="$fx/spool/root"
+    CRON_D_DIR="$fx/cron.d"
+    CRON_DAILY_DIR="$fx/cron.daily"
+    CRON_WEEKLY_DIR="$fx/cron.weekly"
+    CRON_MONTHLY_DIR="$fx/cron.monthly"
+    SYSTEMD_DIR="$fx/systemd"
+    UATT_20="$fx/apt/20auto-upgrades"
+    UATT_50="$fx/apt/50unattended-upgrades"
+    STATE_FILE="$fx/crusty.conf"
+    systemctl() {
+        case "$1" in
+            is-enabled) printf 'enabled\n' ;;
+            is-active)  printf 'active\n' ;;
+        esac
+        return 0
+    }
+    crontab() { return 1; }    # the fixture file is the only crontab source
+}
+export -f maint_env 2>/dev/null || true
+
+# ---- 8a. OnCalendar matrix (schedule preset -> systemd calendar expr) ------
+ONC=$(
+    stub_log; crusty_globals
+    source <("$EXTRACT" maint_oncalendar)
+    MAINT_HOUR=04; MAINT_MINUTE=30
+    MAINT_SCHEDULE=daily;   maint_oncalendar; printf '\n'
+    MAINT_SCHEDULE=weekly;  MAINT_WEEKDAY=Sat; maint_oncalendar; printf '\n'
+    MAINT_SCHEDULE=monthly; MAINT_MDAY=15; maint_oncalendar; printf '\n'
+    MAINT_SCHEDULE=n-days;  maint_oncalendar
+)
+if [[ "$ONC" == $'*-*-* 04:30\nSat *-*-* 04:30\n*-*-15 04:30\n*-*-* 04:30' ]]; then
+    ok
+else
+    fail "OnCalendar matrix (got: $ONC)"
+fi
+
+# ---- 8b. unknown schedule dies (never writes a bogus unit) -----------------
+if (
+    stub_log; crusty_globals
+    source <("$EXTRACT" die)
+    source <("$EXTRACT" maint_oncalendar)
+    MAINT_HOUR=04; MAINT_MINUTE=30; MAINT_SCHEDULE=bogus
+    maint_oncalendar
+) 2>/dev/null; then
+    fail "unknown MAINT_SCHEDULE must die"
+else
+    ok
+fi
+
+# ---- 8c. NO % in any generated systemd unit line (cron-rule hygiene; % is
+#          a specifier escape in unit files) ------------------------------
+NO_PCT=$(
+    stub_log; crusty_globals
+    u_fns=(maint_oncalendar timer_unit_content service_unit_content)
+    for f in "${u_fns[@]}"; do
+        source <("$EXTRACT" "$f")
+    done
+    MAINT_HOUR=04; MAINT_MINUTE=30; MAINT_SCHEDULE=weekly; MAINT_WEEKDAY=Sun
+    {
+        timer_unit_content
+        service_unit_content
+    } | grep '%' && echo PCT-FOUND || echo CLEAN
+)
+if [[ "$NO_PCT" == "CLEAN" ]]; then
+    ok
+else
+    fail "generated maintenance content contains %: $NO_PCT"
+fi
+
+# ---- 8d. generated units pass systemd-analyze verify -----------------------
+if command -v systemd-analyze >/dev/null; then
+    VDIR="$TMP/verify"
+    mkdir -p "$VDIR"
+    (
+        stub_log; crusty_globals
+        v_fns=(maint_oncalendar timer_unit_content service_unit_content
+               maint_script_content)
+        for f in "${v_fns[@]}"; do
+            source <("$EXTRACT" "$f")
+        done
+        MAINT_HOUR=04; MAINT_MINUTE=30; MAINT_SCHEDULE=weekly; MAINT_WEEKDAY=Sun
+        MAINT_SCRIPT="$VDIR/crusty-maintenance"
+        timer_unit_content   > "$VDIR/crusty-maintenance.timer"
+        service_unit_content > "$VDIR/crusty-maintenance.service"
+        maint_script_content > "$VDIR/crusty-maintenance"
+    )
+    chmod 0755 "$VDIR/crusty-maintenance"
+    VERR="$TMP/verify.err"
+    if (cd "$VDIR" && exec systemd-analyze verify \
+            crusty-maintenance.timer crusty-maintenance.service) 2>"$VERR"; then
+        ok
+    else
+        fail "systemd-analyze verify rejected the generated units: $(cat "$VERR")"
+    fi
+else
+    echo "  (systemd-analyze not installed — skipping unit verification)"
+fi
+
+# ---- 8e. stale-sweep fixture: remove ONLY crusty-signed entries, then ------
+#      install + converge (the dry-run-twice zero-change contract)
+FX="$TMP/fixture"
+mkdir -p "$FX"/{systemd/timers.target.wants,cron.d,cron.daily,cron.weekly,cron.monthly,spool,bin,lib/crusty,apt}
+cat > "$FX/spool/root" <<'EOF'
+# crusty updater v1
+17 3 * * * /usr/local/bin/crusty-update --quiet
+30 4 * * 0 /usr/sbin/apticron
+0 5 * * * /usr/local/bin/crusty-docker-prune \
+    --all
+# ansible managed
+EOF
+printf '1 2 3 4 5 /usr/bin/crusty-old-thing\n' > "$FX/cron.d/crusty-auto-update"
+printf '1 2 3 4 5 /usr/bin/other\n'            > "$FX/cron.d/otherpkg"
+printf 'periodic\n' > "$FX/cron.daily/crusty-backup"
+printf 'periodic\n' > "$FX/cron.weekly/unrelated-weekly"
+printf '[Unit]\nDescription=stale\n' > "$FX/systemd/crusty-old.timer"
+printf '[Unit]\nDescription=stale\n' > "$FX/systemd/crusty-old.service"
+printf '[Unit]\nDescription=other\n' > "$FX/systemd/unrelated.timer"
+ln -s ../crusty-old.timer "$FX/systemd/timers.target.wants/crusty-old.timer"
+
+SWEEP_R=$(
+    stub_log; crusty_globals
+    s_fns=(classify_crontab_lines read_root_crontab maint_oncalendar
+           timer_unit_content service_unit_content maint_script_content
+           is_current_crusty_unit
+           scan_stale_crusty sweep_stale_crusty sweep_root_crontab_apply
+           write_if_differs install_maintenance remove_maintenance_machinery)
+    for f in "${s_fns[@]}"; do
+        source <("$EXTRACT" "$f")
+    done
+    maint_env "$FX"
+    ENABLE_MAINTENANCE=true
+    MAINT_HOUR=04; MAINT_MINUTE=30; MAINT_SCHEDULE=daily
+
+    # 1) scan: crusty-signed entries only, unrelated listed report-only
+    scan_stale_crusty
+    [[ ${#SWEEP_REMOVE[@]} -eq 8 ]] || echo "FAIL:remove-count=${#SWEEP_REMOVE[@]}"
+    if printf '%s\n' "${SWEEP_REMOVE[@]}" | grep -v 'crusty' | grep -q .; then
+        echo "FAIL:non-crusty-entry-marked-for-removal"
+    fi
+    printf '%s\n' "${SWEEP_REMOVE[@]}" | grep -q 'cron.d/crusty-auto-update' \
+        || echo "FAIL:v1-cron.d-missed"
+    printf '%s\n' "${SWEEP_REMOVE[@]}" | grep -q 'cron.daily/crusty-backup' \
+        || echo "FAIL:periodic-missed"
+    printf '%s\n' "${SWEEP_REMOVE[@]}" | grep -q 'crusty-old.timer' \
+        || echo "FAIL:stale-timer-missed"
+    printf '%s\n' "${SWEEP_REMOVE[@]}" | grep -q 'crusty-old.service' \
+        || echo "FAIL:stale-service-missed"
+    printf '%s\n' "${SWEEP_REMOVE[@]}" | grep -q 'apticron' \
+        && echo "FAIL:unrelated-crontab-marked"
+    printf '%s\n' "${SWEEP_KEEP[@]}" | grep -q '/usr/sbin/apticron' \
+        || echo "FAIL:unrelated-not-reported"
+
+    # 2) apply the sweep
+    sweep_stale_crusty
+    for gone in "$FX/cron.d/crusty-auto-update" "$FX/cron.daily/crusty-backup" \
+                "$FX/systemd/crusty-old.timer" "$FX/systemd/crusty-old.service" \
+                "$FX/systemd/timers.target.wants/crusty-old.timer"; do
+        [[ -e "$gone" ]] && echo "FAIL:swept-file-still-there: $gone"
+    done
+    for kept in "$FX/cron.d/otherpkg" "$FX/cron.weekly/unrelated-weekly" \
+                "$FX/systemd/unrelated.timer"; do
+        [[ -e "$kept" ]] || echo "FAIL:unrelated-deleted: $kept"
+    done
+    # crontab preserved byte-for-byte minus the crusty lines
+    GOT=$(cat "$FX/spool/root")
+    WANT='30 4 * * 0 /usr/sbin/apticron
+# ansible managed'
+    [[ "$GOT" == "$WANT" ]] || echo "FAIL:crontab-not-preserved"
+    # 3) second scan: squeaky clean
+    scan_stale_crusty
+    [[ ${#SWEEP_REMOVE[@]} -eq 0 ]] || echo "FAIL:second-scan-not-clean:${SWEEP_REMOVE[*]}"
+
+    # 4) install the current machinery (3 files)
+    CHANGES=0
+    install_maintenance
+    [[ $CHANGES -eq 3 ]] || echo "FAIL:install-changes=$CHANGES"
+    [[ -f "$FX/systemd/crusty-maintenance.timer" ]]   || echo "FAIL:timer-not-written"
+    [[ -f "$FX/systemd/crusty-maintenance.service" ]] || echo "FAIL:service-not-written"
+    [[ -x "$FX/bin/crusty-maintenance" ]]             || echo "FAIL:script-not-executable"
+    grep -q 'crusty-maintenance v2' "$FX/systemd/crusty-maintenance.timer" \
+        || echo "FAIL:timer-marker-missing"
+    grep -q 'Persistent=true' "$FX/systemd/crusty-maintenance.timer" \
+        || echo "FAIL:persistent-missing"
+    grep -q 'flock -n 9' "$FX/bin/crusty-maintenance" \
+        || echo "FAIL:script-content-empty"
+    # 5) own units are guarded from the sweep (re-run keeps them)
+    scan_stale_crusty
+    [[ ${#SWEEP_REMOVE[@]} -eq 0 ]] \
+        || echo "FAIL:own-units-swept:${SWEEP_REMOVE[*]}"
+    # 6) dry-run-twice contract: identical re-install = ZERO applied changes
+    install_maintenance
+    [[ $CHANGES -eq 3 ]] || echo "FAIL:converge-not-zero:$CHANGES"
+    echo DONE
+)
+if [[ "$SWEEP_R" == *DONE ]] && ! grep -q 'FAIL' <<< "$SWEEP_R"; then
+    ok
+else
+    fail "sweep/install fixture (see output above): $SWEEP_R"
+fi
+
+# ---- 8f. unattended-upgrades wiring: reboot answers + unmanaged guard ------
+UATT_R=$(
+    stub_log; crusty_globals
+    u_fns=(uatt20_content uatt50_content write_if_differs install_auto_updates)
+    for f in "${u_fns[@]}"; do
+        source <("$EXTRACT" "$f")
+    done
+    fx="$TMP/uatt"; mkdir -p "$fx/apt"
+    UATT_20="$fx/apt/20auto-upgrades"; UATT_50="$fx/apt/50unattended-upgrades"
+    pkg_installed() { return 0; }   # present — apt is never exercised
+    apt_install()   { echo APT-CALLED; return 1; }
+    ENABLE_MAINTENANCE=true; AUTO_UPDATE=true
+
+    AUTO_REBOOT=true; REBOOT_TIME="03:15"
+    install_auto_updates
+    grep -q 'Unattended-Upgrade::Automatic-Reboot "true";' "$fx/apt/50unattended-upgrades" \
+        || echo "FAIL:reboot-on"
+    grep -q 'Unattended-Upgrade::Automatic-Reboot-Time "03:15";' "$fx/apt/50unattended-upgrades" \
+        || echo "FAIL:reboot-time"
+    grep -q 'Unattended-Upgrade::Automatic-Reboot-WithUsers "false";' "$fx/apt/50unattended-upgrades" \
+        || echo "FAIL:withusers"
+    grep -q 'APT::Periodic::Update-Package-Lists "1";' "$fx/apt/20auto-upgrades" \
+        || echo "FAIL:20auto"
+    CHANGES=0; install_auto_updates
+    [[ $CHANGES -eq 0 ]] || echo "FAIL:uatt-converge:$CHANGES"
+
+    rm -f "$fx/apt/50unattended-upgrades"
+    AUTO_REBOOT=false
+    install_auto_updates
+    grep -q 'Unattended-Upgrade::Automatic-Reboot "false";' "$fx/apt/50unattended-upgrades" \
+        || echo "FAIL:reboot-off"
+
+    # unmanaged (non-crusty) 50unattended-upgrades is NEVER clobbered
+    printf '// distro stock\n' > "$fx/apt/50unattended-upgrades"
+    BEFORE=$(md5sum < "$fx/apt/50unattended-upgrades")
+    install_auto_updates
+    AFTER=$(md5sum < "$fx/apt/50unattended-upgrades")
+    [[ "$BEFORE" == "$AFTER" ]] || echo "FAIL:unmanaged-clobbered"
+    echo DONE
+)
+if [[ "$UATT_R" == *DONE ]] && ! grep -q 'FAIL' <<< "$UATT_R"; then
+    ok
+else
+    fail "unattended-upgrades wiring: $UATT_R"
+fi
+
+# ---- 8g. maintenance script content: throttle, flock, no cron --------------
+MSCRIPT=$(
+    stub_log; crusty_globals
+    source <("$EXTRACT" maint_script_content)
+    maint_script_content
+)
+if grep -q 'flock -n 9' <<< "$MSCRIPT" \
+   && grep -q 'MAINT_N_DAYS' <<< "$MSCRIPT" \
+   && grep -q 'conf_get' <<< "$MSCRIPT" \
+   && grep -q 'AUTO_REBOOT' <<< "$MSCRIPT" \
+   && grep -q 'apt-get' <<< "$MSCRIPT" \
+   && grep -q 'shutdown -r' <<< "$MSCRIPT" \
+   && ! grep -q 'crontab' <<< "$MSCRIPT"; then
+    ok
+else
+    fail "maintenance script content sanity"
+fi
+
+# ---- 8h. plan display: schedule block + sweep list -------------------------
+PLAN3=$(
+    stub_log; crusty_globals
+    source <("$EXTRACT" is_container)
+    source <("$EXTRACT" plan_display)
+    MAINT_UNIT_TIMER="/etc/systemd/system/crusty-maintenance.timer"
+    MAINT_UNIT_SERVICE="/etc/systemd/system/crusty-maintenance.service"
+    MAINT_SCRIPT="/usr/local/sbin/crusty-maintenance"
+    TARGET_USER=admin; SET_PASSWORD=""; GRANT_SUDO=no
+    KEEP_KEYS=true; REMOVE_KEYS=(); USER_PUBLIC_KEY="keep"
+    ENABLE_FAIL2BAN=true; ENABLE_MAINTENANCE=true; ENABLE_DOCKER=false
+    CURRENT_SSH_PORTS=(22); SSH_PORT=22; ALLOW_TCP_FORWARDING=no
+    MAINT_HOUR=02; MAINT_MINUTE=00
+    MAINT_SCHEDULE=weekly; MAINT_WEEKDAY=Sun
+    AUTO_UPDATE=true; AUTO_REBOOT=true; REBOOT_TIME="03:00"
+    SWEEP_REMOVE=("cron.d|/etc/cron.d/crusty-auto-update|stale crusty cron.d file")
+    SWEEP_KEEP=("/var/spool/cron/crontabs/root: 30 4 * * 0 /usr/sbin/apticron")
+    BACKUP_ROOT="/var/backups/"
+    UFW_SKIPPED=false; FW_STACK=ufw; FW_OPERATOR_ACK=false; FW_RULES_SEEN=0
+    FW_REMOVE_RULES=(); FW_ALLOW_EXTRA=()
+    plan_display
+)
+if printf '%s' "$PLAN3" | grep -q 'Maintenance timer: weekly on Sun at 02:00' \
+   && printf '%s' "$PLAN3" | grep -q 'unattended-upgrades' \
+   && printf '%s' "$PLAN3" | grep -q 'auto-reboot scheduled at 03:00' \
+   && printf '%s' "$PLAN3" | grep -q 'crusty-auto-update' \
+   && printf '%s' "$PLAN3" | grep -q 'UNRELATED (report-only, never touched)'; then
+    ok
+else
+    fail "plan display lacks the maintenance/sweep block"
 fi
 
 # ----------------------------------------------------------------------------
