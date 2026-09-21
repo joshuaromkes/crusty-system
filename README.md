@@ -49,7 +49,9 @@ A flag pre-fills its answer and skips its prompt. `--yes` takes defaults for the
 --firewall / --no-firewall   UFW on top of any detected firewall stack
                          (interactive pre-flight: warns and asks before layering
                          UFW on a non-UFW stack; reviews existing rules and
-                         inbound listeners; --no-firewall skips UFW outright)
+                         inbound listeners with a one-shot allow; headless /
+                         --yes runs WARN about listeners default-deny would cut
+                         off but never auto-allow; --no-firewall skips UFW)
 --docker / --no-docker   Docker module (default: no)
 --docker-user NAME       docker group member (default: the admin user; implies --docker)
 --fail2ban / --no-fail2ban   default: yes
