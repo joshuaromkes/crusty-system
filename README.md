@@ -67,7 +67,7 @@ A flag pre-fills its answer and skips its prompt. `--yes` takes defaults for the
 | Environment | Detection | Behavior |
 |---|---|---|
 | PVE **host** | `/etc/pve/.node_name` or `pveversion` | **Hard refusal, before any mutation** — hardening breaks PVE cluster root SSH. See [pve.proxmox.com/wiki/Security](https://pve.proxmox.com/wiki/Security) |
-| LXC (privileged / unprivileged) | cgroup/container markers + `/proc/self/uid_map` | Fully supported. UFW/fail2ban are **attempted** and fail soft if the container lacks the capability: they roll back, warn, and the skip is recorded in `/etc/crusty.conf` — never fatal. sudo prompt defaults to no (the PVE console is the admin path) |
+| LXC (privileged / unprivileged) | cgroup/container markers + `/proc/self/uid_map` | Fully supported. UFW works in unprivileged LXCs (per-netns netfilter, userns NET_ADMIN) and protects the container itself; if the apply still fails for lack of capability, UFW/fail2ban roll back, warn, and the skip is recorded in `/etc/crusty.conf` — never fatal. sudo prompt defaults to no (the PVE console is the admin path) |
 | PVE VM | `systemd-detect-virt` (kvm/qemu/...) | Fully supported |
 | Bare metal | `systemd-detect-virt` none | Fully supported |
 
