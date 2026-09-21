@@ -100,7 +100,7 @@ crusty_globals() {
     UFW_SKIPPED=false; F2B_SKIPPED=false
     FW_STACK=none; FW_OPT_OUT=false; FW_OPT_IN=false
     FW_OPERATOR_ACK=false; FW_REVIEWED=false; FW_RULES_SEEN=0
-    FW_ALLOW_EXTRA=(); FW_REMOVE_RULES=()
+    FW_ALLOW_EXTRA=(); FW_REMOVE_RULES=(); FW_CUTOFF=()
     OLD_FW_STACK=""; OLD_FW_ACK=""; OLD_FW_EXTRA_ALLOW=""
     OLD_TARGET_USER=""; OLD_SUDO=""; OLD_SSH_PORT=""; OLD_SSH_KEY_FP=""; OLD_MAINT_TIME=""
     STATE_FILE="/etc/crusty.conf"
@@ -628,6 +628,7 @@ pf_setup() {
     stub_log
     crusty_globals
     source <("$EXTRACT" prompt_firewall)
+    source <("$EXTRACT" fw_compute_cutoff)
     fake_command
     FAKE_UFW=0               # (b) rule review is inert unless a test sets it up
     fw_detect_stack() { :; }        # FW_STACK set by each test
@@ -747,6 +748,53 @@ export -f pf_setup 2>/dev/null || true
   [[ "${#FW_ALLOW_EXTRA[@]}" -eq 0 && "$yesno_calls" == 1 ]]
 ) && ok || fail "declining the listener allow must queue no rules"
 
+# 7d-xii. headless FIRST run with an uncovered listener -> explicit warn,
+#         nothing auto-allowed, zero prompts (the :8080 incident class:
+#         a --yes / no-TTY run must never silently cut off an inbound service)
+( yesno_calls=0
+  pf_setup
+  FW_STACK=none; FW_OPT_OUT=false; FW_OPT_IN=false
+  HAVE_TTY=false; ASSUME_YES=false
+  SSH_PORT=22; CURRENT_SSH_PORTS=(22)
+  fw_listener_lines(){ printf '%s\n' '8080 webui'; }
+  WARNED=""
+  log_warn(){ WARNED+="$*"$'\n'; }
+  prompt_firewall
+  [[ "${#FW_ALLOW_EXTRA[@]}" -eq 0 && "$yesno_calls" == 0 \
+     && "${FW_CUTOFF[*]:-}" == "8080/webui" \
+     && "$(printf '%s' "$WARNED" | grep -c 'default-deny incoming WILL cut off: 8080')" == 1 \
+     && "$(printf '%s' "$WARNED" | grep -c 'headless run: listeners were NOT auto-allowed')" == 1 ]]
+) && ok || fail "headless first run must WARN about cutoff listeners (never silent)"
+
+# 7d-xiii. headless CONVERGED re-run: state-restored listeners are excluded
+#          from the cutoff list -> zero-change re-run stays quiet
+( yesno_calls=0
+  pf_setup
+  FW_STACK=none; FW_OPT_OUT=false; FW_OPT_IN=false
+  HAVE_TTY=false; ASSUME_YES=false
+  SSH_PORT=22; CURRENT_SSH_PORTS=(22)
+  OLD_FW_EXTRA_ALLOW="8080 8443"
+  fw_listener_lines(){ printf '%s\n' '8080 webui' '8443 webui'; }
+  WARNED=""
+  log_warn(){ WARNED+="$*"$'\n'; }
+  prompt_firewall
+  [[ "${FW_ALLOW_EXTRA[*]:-}" == "8080 8443" && -z "$WARNED" ]]
+) && ok || fail "headless converged re-run with restored listeners must stay quiet"
+
+# 7d-xiv. headless run when UFW is SKIPPED (foreign stack kept) -> no cutoff
+#         warning (crusty is not enabling default-deny in that run)
+( yesno_calls=0
+  pf_setup
+  FW_STACK=firewalld; FW_OPT_OUT=false; FW_OPT_IN=false
+  HAVE_TTY=false; ASSUME_YES=false
+  SSH_PORT=22; CURRENT_SSH_PORTS=(22)
+  fw_listener_lines(){ printf '%s\n' '8080 webui'; }
+  WARNED=""
+  log_warn(){ WARNED+="$*"$'\n'; }
+  prompt_firewall
+  [[ "$UFW_SKIPPED" == true && "$(printf '%s' "$WARNED" | grep -c 'WILL cut off')" == 0 ]]
+) && ok || fail "headless skip (foreign stack kept) must not warn about cutoffs"
+
 # ---- 7e. plan display shows the firewall state (module-visibility) --------
 # (a) a converged keep-key re-run with UFW to be enabled shows the Firewall line
 PLAN=$(
@@ -793,6 +841,39 @@ if printf '%s' "$PLAN2" | grep -q 'UFW SKIPPED — existing firewalld stack kept
     ok
 else
     fail "plan display must show the firewall SKIP and the queued listener allows"
+fi
+
+# (c) a cutoff that was DECLINED (or never allowed) must surface in the plan;
+#     an ALLOWED listener must NOT also appear as cut off
+plan_test() {  # $1 = FW_ALLOW_EXTRA array body, $2 = FW_CUTOFF body, $3 = label
+    stub_log
+    crusty_globals
+    source <("$EXTRACT" is_container)
+    source <("$EXTRACT" plan_display)
+    ENV_CLASS="debian"
+    TARGET_USER=admin; SET_PASSWORD=""; GRANT_SUDO=no
+    KEEP_KEYS=true; REMOVE_KEYS=(); USER_PUBLIC_KEY="add a key"
+    ENABLE_FAIL2BAN=true; ENABLE_MAINTENANCE=true; ENABLE_DOCKER=false
+    CURRENT_SSH_PORTS=(22); SSH_PORT=22; ALLOW_TCP_FORWARDING=no
+    MAINT_HOUR=02; MAINT_MINUTE=00; BACKUP_ROOT="/var/backups/"
+    UFW_SKIPPED=false; FW_STACK=ufw; FW_OPERATOR_ACK=false
+    FW_RULES_SEEN=0; FW_REVIEWED=false; FW_REMOVE_RULES=()
+    eval "FW_ALLOW_EXTRA=($1)"; eval "FW_CUTOFF=($2)"
+    plan_display
+}
+PLAN3=$(plan_test "" "'8080/webui' '8443/webui'")
+PLAN4=$(plan_test "8080" "'8080/webui' '8443/webui'")
+if printf '%s' "$PLAN3" | grep -q 'default-deny WILL cut off: 8080 (webui)' \
+   && printf '%s' "$PLAN3" | grep -q 'default-deny WILL cut off: 8443 (webui)'; then
+    ok
+else
+    fail "plan display must surface declined cutoff listeners"
+fi
+if printf '%s' "$PLAN4" | grep -q 'WILL cut off: 8443' \
+   && ! printf '%s' "$PLAN4" | grep -q 'WILL cut off: 8080'; then
+    ok
+else
+    fail "plan display must not list an allowed listener as cut off"
 fi
 
 # ----------------------------------------------------------------------------

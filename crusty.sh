@@ -123,6 +123,7 @@ UFW_TEMP_PORTS=()
 FW_STACK="none"
 FW_REVIEWED=false            # existing rules were shown to the operator
 FW_ALLOW_EXTRA=()            # inbound listeners the operator chose to keep open
+FW_CUTOFF=()                 # "port svc" entries default-deny WOULD cut off (pre-flight)
 FW_RULES_SEEN=0              # count of pre-existing rules shown in the plan
 FW_OPERATOR_ACK=false        # non-UFW stack layering explicitly acknowledged
 FW_OPT_OUT=false             # flag-forced: never layering UFW (--no-firewall)
@@ -286,8 +287,10 @@ What it configures:
                     pre-fill, --dry-run drift view and --uninstall
 
 Refuses to run on a Proxmox VE HOST (cluster SSH would break). Works inside
-PVE guests (LXC/VM) and on bare metal. In containers, UFW/fail2ban fail
-soft: they roll back, warn, and are recorded as skipped — never fatal.
+PVE guests (LXC/VM) and on bare metal. UFW fully works in unprivileged LXCs
+(per-netns netfilter, userns NET_ADMIN) and protects the container itself;
+if an apply still fails for lack of capability, UFW/fail2ban roll back,
+warn, and are recorded as skipped — never fatal.
 
 Recommended two-step install (read what you run):
   curl -fsSLo crusty.sh <URL> && less crusty.sh && sudo bash crusty.sh
@@ -1358,6 +1361,34 @@ fw_listener_lines() {
     }' | sort -n -u
 }
 
+# Compute which inbound TCP listeners UFW default-deny would cut off.
+# Read-only. Sets FW_CUTOFF=() with "<port>/<service>" entries, excluding
+# ports already covered by: the SSH ports, the listeners queued/allowed in
+# a previous run (FW_ALLOW_EXTRA), and existing UFW allow rules. Computed
+# BEFORE the headless early-return in prompt_firewall so a --yes / no-TTY
+# run still warns (the :8080 incident must never be silent).
+fw_compute_cutoff() {
+    FW_CUTOFF=()
+    local -A allowed=()
+    local p spec_line entry
+    for p in "${CURRENT_SSH_PORTS[@]}" "$SSH_PORT"; do allowed[$p]=1; done
+    for entry in "${FW_ALLOW_EXTRA[@]:-}"; do
+        [[ -n "$entry" ]] && allowed["${entry%%/*}"]=1
+    done
+    while IFS= read -r spec_line; do
+        [[ -z "$spec_line" ]] && continue
+        p="${spec_line##* }"; p="${p%%/*}"
+        allowed[$p]=1
+    done < <(fw_rule_specs)
+    local port svcname
+    while read -r port svcname; do
+        [[ -n "$port" ]] || continue
+        [[ -n "${allowed[$port]:-}" ]] && continue
+        FW_CUTOFF+=("$port/$svcname")
+    done < <(fw_listener_lines)
+    return 0
+}
+
 # ─────────────────────────────────────────────────────────────
 # Wizard step — firewall pre-flight (round-4, item 6)
 # ─────────────────────────────────────────────────────────────
@@ -1367,6 +1398,7 @@ prompt_firewall() {
     FW_RULES_SEEN=0
     FW_ALLOW_EXTRA=()
     FW_REMOVE_RULES=()
+    FW_CUTOFF=()
 
     fw_detect_stack
 
@@ -1425,7 +1457,19 @@ prompt_firewall() {
         fi
     fi
 
+    # (c-prep) compute the cutoff list BEFORE any early return: the headless
+    # / --yes path must still WARN — default-deny cutting off an inbound
+    # service is never silent again (round-4, item 6(c), the :8080 incident).
+    fw_compute_cutoff
+
     if [[ "$UFW_SKIPPED" == true || "$HAVE_TTY" != true || "$ASSUME_YES" == true ]]; then
+        if [[ "$UFW_SKIPPED" != true && ${#FW_CUTOFF[@]} -gt 0 ]]; then
+            local entry
+            for entry in "${FW_CUTOFF[@]}"; do
+                log_warn "[!] default-deny incoming WILL cut off: ${entry%%/*} (${entry#*/})"
+            done
+            log_warn "[!] headless run: listeners were NOT auto-allowed — add UFW rules explicitly or re-run interactively"
+        fi
         return 0
     fi
 
@@ -1473,23 +1517,9 @@ $rules"
     fi
 
     # (c) inbound listeners default-deny would cut off: warn + one-shot allow.
-    local -A allowed=()
-    local p spec_line
-    for p in "${CURRENT_SSH_PORTS[@]}" "$SSH_PORT"; do allowed[$p]=1; done
-    while IFS= read -r spec_line; do
-        [[ -z "$spec_line" ]] && continue
-        p="${spec_line##* }"; p="${p%%/*}"
-        allowed[$p]=1
-    done < <(fw_rule_specs)
-    local -a cutoff=()
-    local port svcname entry list=""
-    while read -r port svcname; do
-        [[ -n "$port" ]] || continue
-        [[ -n "${allowed[$port]:-}" ]] && continue
-        cutoff+=("$port/$svcname")
-    done < <(fw_listener_lines)
-    if [[ ${#cutoff[@]} -gt 0 ]]; then
-        for entry in "${cutoff[@]}"; do
+    if [[ ${#FW_CUTOFF[@]} -gt 0 ]]; then
+        local entry list=""
+        for entry in "${FW_CUTOFF[@]}"; do
             list+="  ${entry%%/*}  (${entry#*/})\n"
         done
         local warn_text
@@ -1501,7 +1531,7 @@ Allow them through UFW now? (one-shot; removed rules stay removed)"
         case $yn2 in
             2) return 2 ;;
             1) log_note "listeners NOT auto-allowed — they will be cut off by default-deny" ;;
-            0) for entry in "${cutoff[@]}"; do FW_ALLOW_EXTRA+=("${entry%%/*}"); done
+            0) for entry in "${FW_CUTOFF[@]}"; do FW_ALLOW_EXTRA+=("${entry%%/*}"); done
                log_note "queued allow: ${FW_ALLOW_EXTRA[*]} (inbound listener pre-flight)" ;;
         esac
     fi
@@ -1538,10 +1568,11 @@ plan_display() {
     local mod_note=""
     if is_container; then
         mod_note="
-[!] container detected ($ENV_CLASS): UFW and fail2ban will be ATTEMPTED and
-    fail soft (rollback + skip recorded in $STATE_FILE) if the container
-    lacks the capability. A container firewall protects the container,
-    not the host — the PVE/datacenter boundary is the real firewall."
+[!] container detected ($ENV_CLASS): UFW works in unprivileged LXCs
+    (per-netns netfilter, userns NET_ADMIN) and protects THIS container, not
+    the host — the PVE/datacenter boundary is the real firewall. If the
+    apply fails for lack of capability, it rolls back and is recorded as
+    skipped in $STATE_FILE."
     fi
     local docker_note=""
     if [[ "$ENABLE_DOCKER" == true ]]; then
@@ -1570,6 +1601,18 @@ plan_display() {
     fi
     if [[ ${#FW_ALLOW_EXTRA[@]} -gt 0 ]]; then
         fw_actions+="\n    ALLOW listeners: ${FW_ALLOW_EXTRA[*]} (pre-flight one-shot)"
+    fi
+    if [[ "$UFW_SKIPPED" != true && ${#FW_CUTOFF[@]} -gt 0 ]]; then
+        local _e _p _x _kept
+        for _e in "${FW_CUTOFF[@]}"; do
+            _p="${_e%%/*}"
+            _kept=false
+            for _x in "${FW_ALLOW_EXTRA[@]:-}"; do
+                [[ "${_x%%/*}" == "$_p" ]] && { _kept=true; break; }
+            done
+            [[ "$_kept" == false ]] && \
+                fw_actions+="\n    [!] default-deny WILL cut off: $_p (${_e#*/}) — declined / not auto-allowed"
+        done
     fi
     if (( FW_RULES_SEEN > 0 )) && [[ "$UFW_SKIPPED" != true ]]; then
         fw_actions+="\n    Existing UFW rules ($FW_RULES_SEEN) PRESERVED — never reset (M6)"
