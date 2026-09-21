@@ -36,10 +36,12 @@
 #   G6  fail2ban uses `backend = systemd` (no logpath) — works on fresh
 #       Debian 12 / Ubuntu 24.04 without rsyslog.
 #
-# CRON RULE (never break): the maintenance cron line in write_cron() must
-# contain ZERO '%' characters — cron turns the first unescaped % into a
-# newline and silently truncates the rest of the command. `date -Is` is
-# used for exactly this reason. A self-check grep enforces it at runtime.
+# CRON RULE (never break): crusty v2.1 installs NO cron entries at all —
+# the maintenance scheduler is a systemd timer (cron cannot express
+# "every N days" and a % in any cron command line truncates it, man 5
+# crontab). The sweep still removes old crusty cron leftovers, and the CI
+# `grep 'root flock'` guard stays as a tripwire: if a cron line ever
+# returns, it must still contain ZERO '%' characters.
 #
 # Environment policy:
 #   - PVE HOST: hard refusal, before any mutation (cluster SSH breaks).
@@ -56,14 +58,30 @@ set -Eeuo pipefail
 # Constants
 # ─────────────────────────────────────────────────────────────
 
-CRUSTY_VERSION="2.0.1"
+CRUSTY_VERSION="2.1.0"
 # Env-overridable for tests (a fake-root harness redirects these to a sandbox)
 STATE_FILE="${CRUSTY_STATE_FILE:-/etc/crusty.conf}"
 INSTALL_LOG="${CRUSTY_INSTALL_LOG:-/var/log/crusty-install.log}"
-CRON_FILE="${CRUSTY_CRON_FILE:-/etc/cron.d/crusty-maintenance}"
+CRON_FILE="${CRUSTY_CRON_FILE:-/etc/cron.d/crusty-maintenance}"   # legacy (v2.0) cron — sweep/uninstall only
 JAIL_LOCAL="${CRUSTY_JAIL_LOCAL:-/etc/fail2ban/jail.local}"
 DAEMON_JSON="${CRUSTY_DAEMON_JSON:-/etc/docker/daemon.json}"
 BACKUP_ROOT="${CRUSTY_BACKUP_ROOT:-/root/crusty-backups-}"
+# Maintenance scheduling (v2.1: ONE backend — a systemd timer; no cron).
+# Overridable so the test harness can install/verify in a sandbox.
+ROOT_CRONTAB="${CRUSTY_ROOT_CRONTAB:-/var/spool/cron/crontabs/root}"
+CRON_D_DIR="${CRUSTY_CRON_D:-/etc/cron.d}"
+CRON_DAILY_DIR="${CRUSTY_CRON_DAILY:-/etc/cron.daily}"
+CRON_WEEKLY_DIR="${CRUSTY_CRON_WEEKLY:-/etc/cron.weekly}"
+CRON_MONTHLY_DIR="${CRUSTY_CRON_MONTHLY:-/etc/cron.monthly}"
+SYSTEMD_DIR="${CRUSTY_SYSTEMD_DIR:-/etc/systemd/system}"
+MAINT_UNIT_TIMER="${CRUSTY_TIMER_UNIT:-/etc/systemd/system/crusty-maintenance.timer}"
+MAINT_UNIT_SERVICE="${CRUSTY_SERVICE_UNIT:-/etc/systemd/system/crusty-maintenance.service}"
+MAINT_SCRIPT="${CRUSTY_MAINT_SCRIPT:-/usr/local/sbin/crusty-maintenance}"
+MAINT_RUN_STATE="${CRUSTY_MAINT_STATE:-/var/lib/crusty/maintenance.state}"
+MAINT_LOG="${CRUSTY_MAINT_LOG:-/var/log/crusty-maintenance.log}"
+UATT_20="${CRUSTY_UATT20:-/etc/apt/apt.conf.d/20auto-upgrades}"
+UATT_50="${CRUSTY_UATT50:-/etc/apt/apt.conf.d/50unattended-upgrades}"
+MAINT_MARKER="# crusty-maintenance v2"
 
 # LXC consoles can report 0x0 winsize — keep whiptail happy
 export LINES="${LINES:-24}"
@@ -89,6 +107,17 @@ ENABLE_FAIL2BAN=true
 ENABLE_MAINTENANCE=true
 MAINT_HOUR="02"
 MAINT_MINUTE="00"
+# Maintenance schedule (v2.1): "" = not yet decided (wizard asks); empty
+# weekday/mday/n-days follow the same ask-if-empty rule.
+MAINT_SCHEDULE=""        # daily | weekly | monthly | n-days
+MAINT_WEEKDAY=""         # weekly preset: Mon..Sun
+MAINT_MDAY=""            # monthly preset: 1..28
+MAINT_N_DAYS=""          # n-days preset: 1..365
+AUTO_UPDATE=""           # unattended-upgrades: "" = ask; true/false decided
+AUTO_REBOOT=""           # reboot when upgrades require it: "" = ask
+REBOOT_TIME="02:00"
+MAINT_TIME_FLAG=false    # --time given (skip the clock prompt)
+REBOOT_TIME_FLAG=false   # --reboot-time given (skip the reboot-clock prompt)
 
 # Flags
 DRY_RUN=false
@@ -127,10 +156,21 @@ FW_RULES_SEEN=0              # count of pre-existing rules shown in the plan
 FW_OPERATOR_ACK=false        # non-UFW stack layering explicitly acknowledged
 FW_OPT_OUT=false             # flag-forced: never layering UFW (--no-firewall)
 FW_OPT_IN=false              # flag-forced: revisit/force UFW layering (--firewall)
+# Stale scheduler sweep (v2.1): read-only scan fills these before the plan;
+# entries are "KIND|PATH|description" (KIND: cron-root|cron-d|cron-period|systemd).
+SWEEP_REMOVE=()
+SWEEP_KEEP=()                # unrelated root-crontab entries: report-only
 # Old state (for pre-fill / drift view)
 OLD_TARGET_USER=""
 OLD_SSH_PORT=""
 OLD_MAINT_TIME=""
+OLD_MAINT_SCHEDULE=""
+OLD_MAINT_WEEKDAY=""
+OLD_MAINT_MDAY=""
+OLD_MAINT_N_DAYS=""
+OLD_AUTO_UPDATE=""
+OLD_AUTO_REBOOT=""
+OLD_REBOOT_TIME=""
 OLD_CREATED_USER=""
 OLD_USER_UID=""
 OLD_SUDO_ADDED=""
@@ -251,9 +291,23 @@ Options:
   --docker-user NAME       user added to the docker group
                            (default: the admin user; implies --docker)
   --fail2ban / --no-fail2ban   fail2ban with systemd backend (default: yes)
-  --maintenance / --no-maintenance   weekly local maintenance cron
-                           (default: yes)
-  --time HH:MM             maintenance time, default 02:00 Sunday
+  --maintenance / --no-maintenance   scheduled local maintenance via a
+                           systemd timer (default: yes)
+  --maint-schedule daily|weekly|monthly|n-days
+                           how often maintenance runs (default: weekly)
+  --maint-weekday Mon..Sun   day of the week for the weekly preset
+  --maint-mday N           day of month (1-28) for the monthly preset
+  --maint-n-days N         interval 1-365 for the n-days preset (the timer
+                           fires daily and the maintenance script throttles
+                           itself to every N days)
+  --time HH:MM             maintenance clock time, default 02:00
+  --auto-update / --no-auto-update
+                           install unattended-upgrades (security updates on
+                           a separate distro timer) (default: no)
+  --auto-reboot / --no-auto-reboot
+                           reboot automatically when an upgrade requires it
+                           (default: no — reboot-required is logged instead)
+  --reboot-time HH:MM      reboot clock for --auto-reboot (default 02:00)
   --tcp-forwarding no|local|yes    AllowTcpForwarding, default no
                            (flag only — there is no wizard prompt for it)
   --firewall / --no-firewall   UFW on top of any detected firewall stack
@@ -280,8 +334,11 @@ What it configures:
                     port protected during transitions (C3)
   6. fail2ban       sshd jail, systemd backend (G6), reload-only (H1)
   7. Docker         official repo, hardened daemon.json merged (M3)
-  8. maintenance    weekly LOCAL apt cron (flock, conffile-safe, never
-                    downloads anything; reboots only when the OS asks)
+  8. maintenance    systemd timer + service: apt update/upgrade on the
+                    chosen schedule (flock-serialized, never downloads
+                    anything, local time); optional unattended-upgrades and
+                    auto-reboot; every stale crusty scheduler from OLD
+                    crusty versions is swept first
   9. state          /etc/crusty.conf (0644, no secrets) — powers re-run
                     pre-fill, --dry-run drift view and --uninstall
 
@@ -391,6 +448,28 @@ validate_time() {
     fi
 }
 
+validate_schedule() {
+    case "$1" in
+        daily|weekly|monthly|n-days) return 0 ;;
+    esac
+    return 1
+}
+
+validate_weekday() {
+    case "$1" in
+        Mon|Tue|Wed|Thu|Fri|Sat|Sun) return 0 ;;
+    esac
+    return 1
+}
+
+validate_mday() {
+    [[ "$1" =~ ^[0-9]+$ ]] && (( 10#$1 >= 1 && 10#$1 <= 28 ))
+}
+
+validate_ndays() {
+    [[ "$1" =~ ^[0-9]+$ ]] && (( 10#$1 >= 1 && 10#$1 <= 365 ))
+}
+
 # ─────────────────────────────────────────────────────────────
 # Argument parsing
 # ─────────────────────────────────────────────────────────────
@@ -434,6 +513,43 @@ parse_args() {
                 ENABLE_MAINTENANCE=true; shift ;;
             --no-maintenance)
                 ENABLE_MAINTENANCE=false; shift ;;
+            --maint-schedule)
+                need_value "$@"
+                validate_schedule "$2" || die "Invalid --maint-schedule '$2' (use: daily, weekly, monthly, n-days)"
+                MAINT_SCHEDULE="$2"; shift 2 ;;
+            --maint-weekday)
+                need_value "$@"
+                validate_weekday "$2" || die "Invalid --maint-weekday '$2' (use: Mon Tue Wed Thu Fri Sat Sun)"
+                MAINT_WEEKDAY="$2"
+                [[ -n "$MAINT_SCHEDULE" ]] || MAINT_SCHEDULE="weekly"
+                shift 2 ;;
+            --maint-mday)
+                need_value "$@"
+                validate_mday "$2" || die "Invalid --maint-mday '$2' (use 1-28 — 29+ has no monthly slot)"
+                MAINT_MDAY="$2"
+                [[ -n "$MAINT_SCHEDULE" ]] || MAINT_SCHEDULE="monthly"
+                shift 2 ;;
+            --maint-n-days)
+                need_value "$@"
+                validate_ndays "$2" || die "Invalid --maint-n-days '$2' (use 1-365)"
+                MAINT_N_DAYS="$2"
+                [[ -n "$MAINT_SCHEDULE" ]] || MAINT_SCHEDULE="n-days"
+                shift 2 ;;
+            --auto-update)
+                AUTO_UPDATE=true; shift ;;
+            --no-auto-update)
+                AUTO_UPDATE=false; shift ;;
+            --auto-reboot)
+                AUTO_REBOOT=true; shift ;;
+            --no-auto-reboot)
+                AUTO_REBOOT=false; shift ;;
+            --reboot-time)
+                need_value "$@"
+                if ! validate_time "$2"; then
+                    die "Invalid --reboot-time '$2' (use HH:MM, 24h)"
+                fi
+                printf -v REBOOT_TIME '%02d:%02d' "$((10#${BASH_REMATCH[1]}))" "$((10#${BASH_REMATCH[2]}))"
+                REBOOT_TIME_FLAG=true; shift 2 ;;
             --sudo)
                 GRANT_SUDO=yes; shift ;;
             --no-sudo)
@@ -449,6 +565,7 @@ parse_args() {
                 fi
                 printf -v MAINT_HOUR '%02d' "$((10#${BASH_REMATCH[1]}))"
                 printf -v MAINT_MINUTE '%02d' "$((10#${BASH_REMATCH[2]}))"
+                MAINT_TIME_FLAG=true
                 shift 2 ;;
             --tcp-forwarding)
                 need_value "$@"
@@ -777,6 +894,13 @@ load_state() {
                 TARGET_USER)          OLD_TARGET_USER="$val" ;;
                 SSH_PORT)             OLD_SSH_PORT="$val" ;;
                 MAINT_TIME)           OLD_MAINT_TIME="$val" ;;
+                MAINT_SCHEDULE)       OLD_MAINT_SCHEDULE="$val" ;;
+                MAINT_WEEKDAY)        OLD_MAINT_WEEKDAY="$val" ;;
+                MAINT_MDAY)           OLD_MAINT_MDAY="$val" ;;
+                MAINT_N_DAYS)         OLD_MAINT_N_DAYS="$val" ;;
+                AUTO_UPDATE)          OLD_AUTO_UPDATE="$val" ;;
+                AUTO_REBOOT)          OLD_AUTO_REBOOT="$val" ;;
+                REBOOT_TIME)          OLD_REBOOT_TIME="$val" ;;
                 CRUSTY_CREATED_USER)  OLD_CREATED_USER="$val" ;;
                 CRUSTY_USER_UID)      OLD_USER_UID="$val" ;;
                 SUDO)                 OLD_SUDO="$val" ;;
@@ -805,9 +929,9 @@ wizard() {
         prompt_ssh_key
         prompt_port
         prompt_modules
+        prompt_maintenance
         prompt_firewall
         prompt_docker_user
-        prompt_maint_time
     )
     local i=0 rc=0
     while (( i < ${#steps[@]} )); do
@@ -1143,7 +1267,7 @@ prompt_modules() {
             out=$(ui_box --title "Modules" --checklist \
                     "Choose what to install/configure (Space toggles):" 16 58 4 \
                     "fail2ban"    "Intrusion prevention (systemd backend)" ON \
-                    "maintenance" "Weekly local apt maintenance cron"      ON \
+                    "maintenance" "Scheduled apt maintenance (timer)"      ON \
                     "docker"      "Docker Engine + Compose (hardened)"     OFF) || rc=$?
             case $rc in
                 2) return 2 ;;    # Esc: quit, zero changes
@@ -1193,7 +1317,7 @@ Proceed with both DISABLED?" "no"
         1) ENABLE_FAIL2BAN=false ;;
         0) ENABLE_FAIL2BAN=true ;;
     esac
-    ui_yesno "maintenance" "Enable weekly LOCAL maintenance (apt update/upgrade, conditional reboot)?" "yes"
+    ui_yesno "maintenance" "Enable scheduled LOCAL maintenance (apt update/upgrade, optional auto-update + auto-reboot)?" "yes"
     yn2=$?
     case $yn2 in
         2) return 2 ;;
@@ -1245,36 +1369,195 @@ Default: the admin user ($TARGET_USER)." \
     done
 }
 
-prompt_maint_time() {
+prompt_maintenance() {
+    # Schedule wizard (v2.1): how often + clock time, then unattended
+    # updates, then auto-reboot (+ its clock). Only SCHEDULES a reboot —
+    # the wizard itself never reboots anything.
     if [[ "$ENABLE_MAINTENANCE" != true ]]; then
         return 0
     fi
-    if [[ "${MAINT_HOUR}" != "02" || "${MAINT_MINUTE}" != "00" ]]; then
-        return 0    # pre-filled by --time
-    fi
-    if [[ "$ASSUME_YES" == true ]]; then
-        [[ -n "$OLD_MAINT_TIME" ]] && IFS=: read -r MAINT_HOUR MAINT_MINUTE <<< "$OLD_MAINT_TIME"
-        return 0
-    fi
-    local default="${OLD_MAINT_TIME:-02:00}"
-    local answer rc=0
-    while true; do
-        answer=$(ui_input "Maintenance time" \
-            "Weekly maintenance runs every Sunday at this time (24h HH:MM).
-It is LOCAL and never downloads anything." \
-            "$default") || rc=$?
-        case $rc in
-            2) return 2 ;;
-            1) return 1 ;;
-        esac
-        if ! validate_time "$answer"; then
-            ui_msg "Use 24-hour HH:MM, e.g. 02:00 or 14:30."
-            continue
+    local rc=0 out
+    # 1) schedule preset
+    if [[ -z "$MAINT_SCHEDULE" ]]; then
+        if [[ "$ASSUME_YES" == true ]]; then
+            MAINT_SCHEDULE="${OLD_MAINT_SCHEDULE:-weekly}"
+        else
+            out=$(ui_menu "Maintenance schedule" \
+                "How often should maintenance run? (clock time comes next)" \
+                "daily"   "Every day" \
+                "weekly"  "Once a week (default)" \
+                "monthly" "Once a month (day 1-28)" \
+                "n-days"  "Custom: every N days (1-365)") || rc=$?
+            case $rc in
+                2) return 2 ;;
+                1) return 1 ;;
+            esac
+            MAINT_SCHEDULE="$out"
         fi
-        printf -v MAINT_HOUR '%02d' "$((10#${BASH_REMATCH[1]}))"
-        printf -v MAINT_MINUTE '%02d' "$((10#${BASH_REMATCH[2]}))"
-        return 0
-    done
+    fi
+    # 2) preset-specific answer
+    case "$MAINT_SCHEDULE" in
+        weekly)
+            if [[ -z "$MAINT_WEEKDAY" ]]; then
+                if [[ "$ASSUME_YES" == true ]]; then
+                    MAINT_WEEKDAY="${OLD_MAINT_WEEKDAY:-Sun}"
+                else
+                    out=$(ui_menu "Maintenance weekday" \
+                        "On which day of the week?" \
+                        "Mon" "Monday" \
+                        "Tue" "Tuesday" \
+                        "Wed" "Wednesday" \
+                        "Thu" "Thursday" \
+                        "Fri" "Friday" \
+                        "Sat" "Saturday" \
+                        "Sun" "Sunday (default)") || rc=$?
+                    case $rc in
+                        2) return 2 ;;
+                        1) return 1 ;;
+                    esac
+                    MAINT_WEEKDAY="$out"
+                fi
+            fi
+            ;;
+        monthly)
+            if [[ -z "$MAINT_MDAY" ]]; then
+                if [[ "$ASSUME_YES" == true ]]; then
+                    MAINT_MDAY="${OLD_MAINT_MDAY:-1}"
+                else
+                    while true; do
+                        out=$(ui_input "Maintenance day of month" \
+                            "Which day of the month (1-28)?
+28 is the maximum so EVERY month gets its turn." \
+                            "${OLD_MAINT_MDAY:-1}") || rc=$?
+                        case $rc in
+                            2) return 2 ;;
+                            1) return 1 ;;
+                        esac
+                        if ! validate_mday "$out"; then
+                            ui_msg "Use a day from 1 to 28 (29+ has no slot in every month)."
+                            continue
+                        fi
+                        printf -v MAINT_MDAY '%d' "$((10#$out))"
+                        break
+                    done
+                fi
+            fi
+            ;;
+        n-days)
+            if [[ -z "$MAINT_N_DAYS" ]]; then
+                if [[ "$ASSUME_YES" == true ]]; then
+                    MAINT_N_DAYS="${OLD_MAINT_N_DAYS:-7}"
+                else
+                    while true; do
+                        out=$(ui_input "Maintenance interval" \
+                            "Run maintenance every N days (1-365)?
+The timer fires daily and skips until N days have passed." \
+                            "${OLD_MAINT_N_DAYS:-7}") || rc=$?
+                        case $rc in
+                            2) return 2 ;;
+                            1) return 1 ;;
+                        esac
+                        if ! validate_ndays "$out"; then
+                            ui_msg "Use a number from 1 to 365."
+                            continue
+                        fi
+                        printf -v MAINT_N_DAYS '%d' "$((10#$out))"
+                        break
+                    done
+                fi
+            fi
+            ;;
+        *)
+            die "internal: unknown maintenance schedule '$MAINT_SCHEDULE'"
+            ;;
+    esac
+    # 3) clock time (HH:MM, 24h, local)
+    if [[ "$MAINT_TIME_FLAG" != true ]]; then
+        if [[ "$ASSUME_YES" == true ]]; then
+            [[ -n "$OLD_MAINT_TIME" ]] && IFS=: read -r MAINT_HOUR MAINT_MINUTE <<< "$OLD_MAINT_TIME"
+        else
+            local default="${OLD_MAINT_TIME:-02:00}"
+            local answer
+            while true; do
+                answer=$(ui_input "Maintenance time" \
+                    "Maintenance runs at this time (24h HH:MM).
+It is LOCAL and never downloads anything." \
+                    "$default") || rc=$?
+                case $rc in
+                    2) return 2 ;;
+                    1) return 1 ;;
+                esac
+                if ! validate_time "$answer"; then
+                    ui_msg "Use 24-hour HH:MM, e.g. 02:00 or 14:30."
+                    continue
+                fi
+                printf -v MAINT_HOUR '%02d' "$((10#${BASH_REMATCH[1]}))"
+                printf -v MAINT_MINUTE '%02d' "$((10#${BASH_REMATCH[2]}))"
+                break
+            done
+        fi
+    fi
+    # 4) automatic updates (unattended-upgrades)
+    if [[ -z "$AUTO_UPDATE" ]]; then
+        if [[ "$ASSUME_YES" == true ]]; then
+            AUTO_UPDATE="${OLD_AUTO_UPDATE:-false}"
+            [[ "$AUTO_UPDATE" == "1" ]] && AUTO_UPDATE=true
+        else
+            ui_yesno "Automatic updates" \
+                "Install unattended-upgrades (security updates applied
+automatically on their own timer, independent of the
+maintenance run)?" "no"
+            rc=$?
+            case $rc in
+                2) return 2 ;;
+                1) AUTO_UPDATE=false ;;
+                0) AUTO_UPDATE=true ;;
+            esac
+        fi
+    fi
+    # 5) automatic reboot when upgrades require it
+    if [[ -z "$AUTO_REBOOT" ]]; then
+        if [[ "$ASSUME_YES" == true ]]; then
+            AUTO_REBOOT="${OLD_AUTO_REBOOT:-false}"
+            [[ "$AUTO_REBOOT" == "1" ]] && AUTO_REBOOT=true
+        else
+            ui_yesno "Automatic reboot" \
+                "Reboot automatically when an upgrade requires it?
+Off: 'reboot required' is only logged for you to act on." "no"
+            rc=$?
+            case $rc in
+                2) return 2 ;;
+                1) AUTO_REBOOT=false ;;
+                0) AUTO_REBOOT=true ;;
+            esac
+        fi
+    fi
+    # 6) reboot clock (only scheduled, never rebooted from the wizard)
+    if [[ "$AUTO_REBOOT" == true && "$REBOOT_TIME_FLAG" != true ]]; then
+        if [[ "$ASSUME_YES" == true ]]; then
+            [[ -n "$OLD_REBOOT_TIME" ]] && REBOOT_TIME="$OLD_REBOOT_TIME"
+        else
+            local rdefault="${OLD_REBOOT_TIME:-02:00}"
+            local ranswer
+            while true; do
+                ranswer=$(ui_input "Reboot time" \
+                    "When an upgrade requires a reboot, it is scheduled for
+this time (24h HH:MM). Nothing reboots during this wizard." \
+                    "$rdefault") || rc=$?
+                case $rc in
+                    2) return 2 ;;
+                    1) return 1 ;;
+                esac
+                if ! validate_time "$ranswer"; then
+                    ui_msg "Use 24-hour HH:MM, e.g. 02:00 or 04:30."
+                    continue
+                fi
+                printf -v REBOOT_TIME '%02d:%02d' "$((10#${BASH_REMATCH[1]}))" "$((10#${BASH_REMATCH[2]}))"
+                break
+            done
+        fi
+    fi
+    return 0
 }
 
 # ─────────────────────────────────────────────────────────────
@@ -1576,6 +1859,43 @@ plan_display() {
         [[ "$FW_REVIEWED" == true ]] && fw_actions+=" (reviewed by operator)"
     fi
 
+    # Maintenance summary (v2.1: systemd timer + schedule answers)
+    local maint_desc="no"
+    if [[ "$ENABLE_MAINTENANCE" == true ]]; then
+        case "$MAINT_SCHEDULE" in
+            daily)   maint_desc="daily at ${MAINT_HOUR}:${MAINT_MINUTE}" ;;
+            weekly)  maint_desc="weekly on ${MAINT_WEEKDAY:-?} at ${MAINT_HOUR}:${MAINT_MINUTE}" ;;
+            monthly) maint_desc="monthly on day ${MAINT_MDAY:-?} at ${MAINT_HOUR}:${MAINT_MINUTE}" ;;
+            n-days)  maint_desc="every ${MAINT_N_DAYS:-?} days at ${MAINT_HOUR}:${MAINT_MINUTE}" ;;
+            *)       maint_desc="unconfigured" ;;
+        esac
+    fi
+    local uatt_desc="not installed"
+    if [[ "$ENABLE_MAINTENANCE" == true && "$AUTO_UPDATE" == true ]]; then
+        uatt_desc="unattended-upgrades (security updates on the distro timer)"
+    fi
+    local reboot_desc="logged only (no auto-reboot)"
+    if [[ "$ENABLE_MAINTENANCE" == true && "$AUTO_REBOOT" == true ]]; then
+        reboot_desc="auto-reboot scheduled at $REBOOT_TIME when required"
+    fi
+
+    # Stale scheduler sweep summary (read-only scan ran before the plan)
+    local sweep_note="no stale crusty scheduler entries"
+    local sweep_actions=""
+    local entry
+    if (( ${#SWEEP_REMOVE[@]} > 0 )); then
+        sweep_note="REMOVE ${#SWEEP_REMOVE[@]} stale crusty scheduler entr$( [[ ${#SWEEP_REMOVE[@]} == 1 ]] && printf y || printf ies)"
+        for entry in "${SWEEP_REMOVE[@]}"; do
+            sweep_actions+=$'\n'"    ${entry#*|}   (${entry%%|*})"
+        done
+    fi
+    if (( ${#SWEEP_KEEP[@]} > 0 )); then
+        sweep_actions+=$'\n'"    UNRELATED (report-only, never touched):"
+        for entry in "${SWEEP_KEEP[@]}"; do
+            sweep_actions+=$'\n'"      $entry"
+        done
+    fi
+
     cat << EOF
 
 ================ crusty PLAN ================
@@ -1589,7 +1909,10 @@ SSH port         : ${CURRENT_SSH_PORTS[*]} -> $SSH_PORT
 TCP forwarding   : $ALLOW_TCP_FORWARDING (flag-only)
 MODULES          : $mod_flags
 Fail2ban         : $([[ "$ENABLE_FAIL2BAN" == true ]] && printf yes || printf no) (backend=systemd, reload-only)
-Maintenance cron  : $([[ "$ENABLE_MAINTENANCE" == true ]] && printf 'weekly Sunday %s (local, never downloads)' "${MAINT_HOUR}:${MAINT_MINUTE}" || printf no)
+Maintenance timer: $maint_desc (systemd, local time, never downloads)
+  auto-updates   : $uatt_desc
+  auto-reboot    : $reboot_desc
+Stale sweep      : $sweep_note$sweep_actions
 Docker           : $([[ "$ENABLE_DOCKER" == true ]] && printf yes || printf no)$docker_note$mod_note
 Firewall         : $fw_note$fw_actions
 
@@ -1598,6 +1921,7 @@ Artifacts crusty will own:
   - /home/$TARGET_USER/.ssh/authorized_keys (0600, atomic dedup append)
   - $(getent passwd "$TARGET_USER" >/dev/null 2>&1 && printf 'existing user kept' || printf '/home/%s + passwd entry (only if created by crusty)' "$TARGET_USER")
   - $STATE_FILE (0644, no secrets)
+  - maintenance: $MAINT_UNIT_TIMER + $MAINT_UNIT_SERVICE + $MAINT_SCRIPT
   - backups under ${BACKUP_ROOT}<timestamp>/
   - nothing in any user dotfiles (zero login-cosmetics footprint)
 ============================================
@@ -1665,6 +1989,182 @@ heal_v1_relics() {
 }
 
 # ─────────────────────────────────────────────────────────────
+# STALE SWEEP (v2.1) — remove EVERY scheduler crusty ever installed:
+# v1 cron leftovers in ANY form, the v2.0 cron file, stray crusty systemd
+# units. HARD GUARD: only crusty-signed entries are removed — an unrelated
+# root-crontab line is listed in the plan as found-but-untouched (report
+# only). Runs FIRST in the apply phase so two schedulers can never
+# coexist, and honors --dry-run (the plan is the dry-run view).
+# ─────────────────────────────────────────────────────────────
+
+# Classify root-crontab lines read on stdin. Emits "D<TAB>line" (drop:
+# the line contains 'crusty') or "K<TAB>line" (keep: no crusty signature).
+# A dropped line ending in '\' carries its cron line-continuations with it.
+classify_crontab_lines() {
+    local dropcont=false
+    local line
+    while IFS= read -r line; do
+        if [[ "$dropcont" == true ]]; then
+            printf 'D\t%s\n' "$line"
+            [[ "$line" == *\\ ]] && dropcont=true || dropcont=false
+        elif [[ "$line" == *crusty* ]]; then
+            printf 'D\t%s\n' "$line"
+            [[ "$line" == *\\ ]] && dropcont=true || dropcont=false
+        else
+            dropcont=false
+            printf 'K\t%s\n' "$line"
+        fi
+    done
+}
+
+# Read the root crontab into RC_CONTENT (verbatim) and set RC_SRC to the
+# source label ("file path" or "crontab(1)") — empty when there is no
+# crontab. Sets GLOBALS directly: the sweep needs both the content and the
+# source, and command substitution would lose any assignment the function
+# makes (subshell — this bit scan_stale_crusty under set -u).
+read_root_crontab() {
+    RC_SRC=""; RC_CONTENT=""
+    if [[ -f "$ROOT_CRONTAB" ]]; then
+        RC_SRC="$ROOT_CRONTAB"
+        RC_CONTENT=$(cat "$ROOT_CRONTAB")
+        return 0
+    fi
+    if command -v crontab >/dev/null 2>&1; then
+        local c
+        if c=$(crontab -u root -l 2>/dev/null); then
+            RC_SRC="crontab -u root -l"
+            RC_CONTENT="$c"
+        fi
+    fi
+    return 0
+}
+
+# A crusty unit that matches the exact content THIS run would install is
+# kept, not swept (re-run idempotency). The implementation lives with the
+# timer/unit generators in the maintenance-backend section.
+# Read-only scan of every crusty scheduler location. Fills SWEEP_REMOVE
+# ("KIND|PATH|description") and SWEEP_KEEP (report-only lines). Safe to
+# call at plan time and again at apply time.
+scan_stale_crusty() {
+    SWEEP_REMOVE=()
+    SWEEP_KEEP=()
+    local content src line kind p f base
+    # a) root crontab — ANY line containing 'crusty' (v1 wrote
+    #    crusty-update / crusty updater / crusty-maintenance in all forms)
+    src=""
+    read_root_crontab
+    content="$RC_CONTENT"
+    src="$RC_SRC"
+    if [[ -n "$src" ]]; then
+        while IFS=$'\t' read -r kind line; do
+            if [[ "$kind" == "D" ]]; then
+                SWEEP_REMOVE+=("cron-root|$src|crusty crontab entry: ${line:0:70}")
+            elif [[ "$line" != "#"* && -n "$line" ]]; then
+                SWEEP_KEEP+=("$src: ${line:0:70}")
+            fi
+        done < <(classify_crontab_lines <<< "$content")
+    fi
+    # b) /etc/cron.d/crusty* (v1: crusty-auto-update/-self-update/
+    #    -docker-prune; v2.0: crusty-maintenance)
+    for p in "$CRON_D_DIR"/*crusty*; do
+        [[ -e "$p" || -L "$p" ]] && SWEEP_REMOVE+=("cron.d|$p|stale crusty cron.d file")
+    done
+    # c) periodic run-parts dirs
+    for p in "$CRON_DAILY_DIR"/crusty* "$CRON_WEEKLY_DIR"/crusty* "$CRON_MONTHLY_DIR"/crusty*; do
+        [[ -e "$p" || -L "$p" ]] && SWEEP_REMOVE+=("cron-periodic|$p|stale crusty periodic job")
+    done
+    # d) systemd (defensive — v1 used cron): crusty*.timer / crusty*.service
+    #    EXCEPT the exact units this run would install (idempotency)
+    for f in "$SYSTEMD_DIR"/crusty*.timer "$SYSTEMD_DIR"/crusty*.service; do
+        [[ -e "$f" || -L "$f" ]] || continue
+        if [[ -f "$f" ]] && is_current_crusty_unit "$f"; then
+            continue
+        fi
+        base=$(basename "$f")
+        SWEEP_REMOVE+=("systemd|$f|stale crusty systemd unit ($base)")
+    done
+    return 0
+}
+
+# Apply the sweep. Re-scans first so it acts on the live state, not the
+# plan snapshot taken minutes earlier.
+sweep_stale_crusty() {
+    set_step "stale crusty scheduler sweep"
+    scan_stale_crusty
+    local entry kind path desc base w
+    local root_done=""
+    for entry in "${SWEEP_REMOVE[@]:-}"; do
+        [[ -z "$entry" ]] && continue
+        IFS='|' read -r kind path desc <<< "$entry"
+        case "$kind" in
+            cron-root)
+                if [[ "$root_done" != "$path" ]]; then
+                    root_done="$path"
+                    sweep_root_crontab_apply "$path"
+                fi
+                ;;
+            cron.d|cron-periodic)
+                rm -f "$path"
+                CHANGES=$((CHANGES + 1))
+                log "swept: removed stale crusty cron file $path"
+                ;;
+            systemd)
+                base=$(basename "$path")
+                if command -v systemctl >/dev/null 2>&1; then
+                    systemctl disable --now "$base" >/dev/null 2>&1 || true
+                fi
+                rm -f "$path"
+                CHANGES=$((CHANGES + 1))
+                log "swept: removed stale crusty systemd unit $path"
+                ;;
+        esac
+    done
+    # leftover enable symlinks (unit file already gone, wants-link left)
+    for w in "$SYSTEMD_DIR"/*.wants/crusty* "$SYSTEMD_DIR"/*.requires/crusty*; do
+        if [[ -L "$w" ]]; then
+            rm -f "$w"
+            CHANGES=$((CHANGES + 1))
+            log "swept: removed stale crusty enable symlink $w"
+        fi
+    done
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl daemon-reload >/dev/null 2>&1 || true
+    fi
+}
+
+# Rewrite the root crontab without its crusty entries, preserving every
+# unrelated line byte-for-byte. Spool file: preserve mode/owner, atomic
+# move. crontab(1) source: install via `crontab -u root`.
+sweep_root_crontab_apply() {
+    local src="$1" content tmp kept=0 line
+    read_root_crontab
+    content="$RC_CONTENT"
+    if [[ -z "$RC_SRC" ]]; then
+        return 0    # vanished between scan and apply — nothing to do
+    fi
+    tmp=$(mktemp "${ROOT_CRONTAB}.sweep.XXXXXX")
+    while IFS= read -r line; do
+        printf '%s\n' "$line" >> "$tmp"
+        kept=$((kept + 1))
+    done < <(classify_crontab_lines <<< "$content" | awk -F'\t' '$1 == "K" { print substr($0, 3) }')
+    if [[ "$RC_SRC" == "$ROOT_CRONTAB" ]]; then
+        chown --reference="$ROOT_CRONTAB" "$tmp" 2>/dev/null || true
+        chmod --reference="$ROOT_CRONTAB" "$tmp" 2>/dev/null || chmod 0600 "$tmp"
+        mv -f "$tmp" "$ROOT_CRONTAB"
+    else
+        if crontab -u root "$tmp" 2>/dev/null; then
+            rm -f "$tmp"
+        else
+            rm -f "$tmp"
+            log_warn "could not rewrite the root crontab via crontab(1) — entries left as-is"
+            return 0
+        fi
+    fi
+    CHANGES=$((CHANGES + 1))
+    log "swept: removed crusty entries from the root crontab ($kept unrelated line(s) kept)"
+}
+
+# ─────────────────────────────────────────────────────────────
 # Apply: packages
 # ─────────────────────────────────────────────────────────────
 
@@ -1719,12 +2219,6 @@ install_packages() {
         fi
     elif [[ "$ENABLE_FAIL2BAN" == true ]]; then
         log "[ok] fail2ban present"
-    fi
-    if [[ "$ENABLE_MAINTENANCE" == true ]] && ! pkg_installed cron; then
-        apt_install cron
-        systemctl enable --now cron >/dev/null 2>&1 || true
-        CHANGES=$((CHANGES + 1))
-        log "installed cron"
     fi
     if [[ "$ENABLE_DOCKER" == true ]]; then
         pkg_installed jq || apt_install jq || log_warn "jq missing — daemon.json merge will use the backup+overwrite fallback (M3)"
@@ -2566,42 +3060,280 @@ apply_docker() {
 }
 
 # ─────────────────────────────────────────────────────────────
-# Apply: weekly maintenance cron (spec §3 — EXACT line, %-free)
-# ─────────────────────────────────────────────────────────────────
-# GUARD: cron turns the first unescaped % into a newline and truncates the
-# command. `date -Is` is used on purpose. The grep below fails the run if
-# anyone ever reintroduces a % here.
-# ─────────────────────────────────────────────────────────────────────
+# Maintenance backend (v2.1): ONE scheduler — a systemd timer.
+# Plain cron has no "every N days" field, so n-days is a DAILY timer with
+# a throttle inside the service (last-run epoch in MAINT_RUN_STATE).
+# ─────────────────────────────────────────────────────────────
 
-write_cron() {
-    if [[ "$ENABLE_MAINTENANCE" != true ]]; then
-        if [[ -f "$CRON_FILE" ]]; then
-            rm -f "$CRON_FILE"
-            CHANGES=$((CHANGES + 1))
-            log_note "maintenance not selected — removed $CRON_FILE"
-        fi
-        return 0
-    fi
-    set_step "weekly maintenance cron (I7: converge, %-free)"
-    local desired_cron
-    desired_cron=$(cat << EOF
-# crusty — weekly LOCAL maintenance. Never downloads anything.
-SHELL=/bin/bash
-PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-$MAINT_MINUTE $MAINT_HOUR * * 0 root flock -n /run/crusty-maintenance.lock /bin/bash -c 'exec >>/var/log/crusty-maintenance.log 2>&1; export DEBIAN_FRONTEND=noninteractive; echo "=== \$(date -Is) crusty maintenance ==="; apt-get -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" update -qq; apt-get -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" upgrade -y -qq; apt-get -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" autoremove --purge -y -qq; apt-get autoclean -qq; if [ -f /var/run/reboot-required ]; then echo "reboot-required — rebooting in 5 min"; shutdown -r +5 "crusty: reboot required"; else echo "no reboot required"; fi'
+# OnCalendar expression for the chosen schedule (local time).
+maint_oncalendar() {
+    local t="${MAINT_HOUR}:${MAINT_MINUTE}"
+    case "$MAINT_SCHEDULE" in
+        daily)   printf '*-*-* %s' "$t" ;;
+        weekly)  printf '%s *-*-* %s' "$MAINT_WEEKDAY" "$t" ;;
+        monthly) printf '*-*-%s %s' "$MAINT_MDAY" "$t" ;;
+        n-days)  printf '*-*-* %s' "$t" ;;   # daily fire; service throttles
+        *)       die "internal: unknown maintenance schedule '$MAINT_SCHEDULE'" ;;
+    esac
+}
+
+timer_unit_content() {
+    cat << EOF
+$MAINT_MARKER — generated by crusty; edits are overwritten on re-run.
+[Unit]
+Description=crusty maintenance schedule (apt update/upgrade, never downloads)
+
+[Timer]
+OnCalendar=$(maint_oncalendar)
+Persistent=true
+Unit=crusty-maintenance.service
+
+[Install]
+WantedBy=timers.target
 EOF
-)
-    if [[ -f "$CRON_FILE" ]] && [[ "$(md5sum "$CRON_FILE" | cut -d' ' -f1)" == "$(printf '%s\n' "$desired_cron" | md5sum | cut -d' ' -f1)" ]]; then
-        log "[ok] $CRON_FILE already converged — identical content (I7)"
+}
+
+service_unit_content() {
+    cat << EOF
+$MAINT_MARKER — generated by crusty; edits are overwritten on re-run.
+[Unit]
+Description=crusty maintenance (apt update/upgrade/autoremove; reads /etc/crusty.conf)
+
+[Service]
+Type=oneshot
+ExecStart=$MAINT_SCRIPT
+Nice=10
+IOSchedulingClass=idle
+EOF
+}
+
+# The maintenance script the service runs. Quoted heredoc — nothing is
+# expanded at generation time. Reads its answers from /etc/crusty.conf so
+# re-runs converge without regenerating the script.
+maint_script_content() {
+    cat << 'CRUSTY_MAINT_EOF'
+#!/usr/bin/env bash
+# crusty-maintenance v2 — generated by crusty; edits are overwritten on re-run.
+# Reads /etc/crusty.conf. Logging is plain fd redirection into the log file
+# (no pipes in the logging path — SIGPIPE-safe by construction).
+set -uo pipefail
+
+CONF=/etc/crusty.conf
+LOG=/var/log/crusty-maintenance.log
+LASTRUN=/var/lib/crusty/maintenance.state
+LOCK=/run/crusty-maintenance.lock
+
+conf_get() {
+    # KEY -> value printed on stdout (empty when absent)
+    local key="$1" line
+    [[ -f "$CONF" ]] || return 0
+    while IFS= read -r line; do
+        if [[ "$line" == "$key="* ]]; then
+            printf '%s' "${line#*=}"
+            return 0
+        fi
+    done < "$CONF"
+    return 0
+}
+
+export DEBIAN_FRONTEND=noninteractive
+mkdir -p /var/lib/crusty
+
+# flock-serialize: overlapping runs (manual + timer) never double-apt
+exec 9>"$LOCK" 2>/dev/null || exit 1
+if ! flock -n 9; then
+    exit 0    # another maintenance run is active
+fi
+
+{
+    echo "=== $(date -Is) crusty maintenance start ==="
+
+    # n-days throttle: the timer fires daily; the service skips until
+    # (now - last-run) >= MAINT_N_DAYS * 86400. The window start is
+    # recorded when a run proceeds (a failed run still consumes the slot
+    # — better than hammering apt every day after a persistent failure).
+    n=$(conf_get MAINT_N_DAYS)
+    [[ "$n" =~ ^[0-9]+$ ]] || n=1
+    if (( n >= 2 )); then
+        now=$(date +%s)
+        last=""
+        if [[ -f "$LASTRUN" ]]; then
+            last=$(head -n 1 "$LASTRUN" 2>/dev/null)
+        fi
+        if [[ "$last" =~ ^[0-9]+$ ]] && (( now - last < n * 86400 )); then
+            echo "throttled: MAINT_N_DAYS=$n, next window not reached — skipping"
+            exit 0
+        fi
+        printf '%s\n' "$now" > "$LASTRUN"
+    fi
+
+    apt-get -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" update -qq
+    apt-get -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" upgrade -y -qq
+    apt-get -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" autoremove --purge -y -qq
+    apt-get autoclean -qq
+
+    if [[ -f /var/run/reboot-required ]]; then
+        if [[ "$(conf_get AUTO_REBOOT)" == "1" ]]; then
+            rt=$(conf_get REBOOT_TIME)
+            [[ "$rt" =~ ^[0-2][0-9]:[0-5][0-9]$ ]] || rt="02:00"
+            echo "reboot-required — scheduling reboot at $rt (AUTO_REBOOT=1)"
+            shutdown -r "$rt" "crusty: reboot required" || echo "shutdown scheduling failed (rc $?)"
+        else
+            echo "reboot-required — AUTO_REBOOT is off: manual action needed"
+        fi
+    else
+        echo "no reboot required"
+    fi
+
+    echo "=== $(date -Is) crusty maintenance end ==="
+} >> "$LOG" 2>&1
+exec 9>&-
+CRUSTY_MAINT_EOF
+}
+
+# Write a file only when its content differs (idempotency: a converged
+# box must report ZERO changes). Atomic write inside the target directory.
+write_if_differs() {    # $1 path $2 content $3 description $4 mode (default 0644)
+    local path="$1" content="$2" desc="$3" mode="${4:-0644}"
+    local want cur=""
+    want=$(printf '%s\n' "$content" | md5sum | cut -d' ' -f1)
+    if [[ -f "$path" ]]; then
+        cur=$(md5sum < "$path" | cut -d' ' -f1)
+    fi
+    if [[ "$cur" == "$want" ]]; then
+        log "[ok] $desc already converged — identical content"
         return 0
     fi
-    printf '%s\n' "$desired_cron" > "$CRON_FILE"
-    chmod 0644 "$CRON_FILE"
-    if grep -q '%' "$CRON_FILE"; then
-        die "cron self-check FAILED: '%' found in $CRON_FILE — the whole maintenance chain would be truncated (man 5 crontab). This is a bug in crusty."
-    fi
+    local tmp
+    tmp=$(mktemp "$(dirname "$path")/.crusty.XXXXXX")
+    printf '%s\n' "$content" > "$tmp"
+    chmod "$mode" "$tmp"
+    mv -f "$tmp" "$path"
     CHANGES=$((CHANGES + 1))
-    log "[ok] weekly maintenance cron written (Sunday ${MAINT_HOUR}:${MAINT_MINUTE}, flock-serialized, conffile-safe, never downloads)"
+    log "[ok] wrote $desc"
+}
+
+# True when the unit file on disk is byte-identical to what THIS run would
+# install (the sweep's keep-current guard — a converged re-run must not
+# touch its own units).
+is_current_crusty_unit() {
+    local f="$1" base
+    if [[ "$ENABLE_MAINTENANCE" != true ]]; then
+        return 1
+    fi
+    base=$(basename "$f")
+    local want cur=""
+    case "$base" in
+        crusty-maintenance.timer)   want=$(printf '%s\n' "$(timer_unit_content)" | md5sum | cut -d' ' -f1) ;;
+        crusty-maintenance.service) want=$(printf '%s\n' "$(service_unit_content)" | md5sum | cut -d' ' -f1) ;;
+        *) return 1 ;;
+    esac
+    cur=$(md5sum < "$f" | cut -d' ' -f1)
+    [[ "$cur" == "$want" ]]
+}
+
+# Remove the v2.1 machinery (maintenance declined, or uninstall).
+remove_maintenance_machinery() {
+    local f
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl disable --now crusty-maintenance.timer >/dev/null 2>&1 || true
+    fi
+    for f in "$MAINT_UNIT_TIMER" "$MAINT_UNIT_SERVICE" "$MAINT_SCRIPT"; do
+        if [[ -e "$f" ]]; then
+            rm -f "$f"
+            CHANGES=$((CHANGES + 1))
+            log "removed $f (maintenance not selected)"
+        fi
+    done
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl daemon-reload >/dev/null 2>&1 || true
+    fi
+}
+
+install_maintenance() {
+    set_step "maintenance scheduling (systemd timer)"
+    if [[ "$ENABLE_MAINTENANCE" != true ]]; then
+        remove_maintenance_machinery
+        return 0
+    fi
+    if ! command -v systemctl >/dev/null 2>&1; then
+        log_warn "systemctl not available — maintenance scheduling SKIPPED (soft-fail)"
+        return 0
+    fi
+    write_if_differs "$MAINT_UNIT_TIMER" "$(timer_unit_content)" "crusty-maintenance.timer" 0644
+    write_if_differs "$MAINT_UNIT_SERVICE" "$(service_unit_content)" "crusty-maintenance.service" 0644
+    write_if_differs "$MAINT_SCRIPT" "$(maint_script_content)" "crusty-maintenance script" 0755
+    mkdir -p "$(dirname "$MAINT_RUN_STATE")"
+    local was_enabled="" was_active=""
+    was_enabled=$(systemctl is-enabled crusty-maintenance.timer 2>/dev/null || true)
+    was_active=$(systemctl is-active crusty-maintenance.timer 2>/dev/null || true)
+    if ! systemctl daemon-reload >/dev/null 2>&1; then
+        log_warn "systemctl daemon-reload failed — the timer may not pick up the new units (soft-fail)"
+        return 0
+    fi
+    if systemctl enable --now crusty-maintenance.timer >/dev/null 2>&1; then
+        if [[ "$was_enabled" != "enabled" || "$was_active" != "active" ]]; then
+            CHANGES=$((CHANGES + 1))
+            log "[ok] enabled crusty-maintenance.timer ($(maint_oncalendar), Persistent=true)"
+        else
+            log "[ok] crusty-maintenance.timer already enabled and active"
+        fi
+    else
+        log_warn "could not enable crusty-maintenance.timer (no systemd running in this container?) — soft-fail"
+    fi
+}
+
+# ─────────────────────────────────────────────────────────────
+# Auto-updates (v2.1): unattended-upgrades, converged like everything
+# else. Never run from the wizard — the distro's own timers own execution;
+# crusty only installs the package and pins the config.
+# ─────────────────────────────────────────────────────────────
+
+uatt20_content() {
+    cat << EOF
+// $MAINT_MARKER — generated by crusty; edits are overwritten on re-run.
+APT::Periodic::Update-Package-Lists "1";
+APT::Periodic::Unattended-Upgrade "1";
+EOF
+}
+
+uatt50_content() {
+    cat << EOF
+// $MAINT_MARKER — generated by crusty; edits are overwritten on re-run.
+Unattended-Upgrade::Allowed-Origins {
+    "\${distro_id}:\${distro_codename}";
+    "\${distro_id}:\${distro_codename}-security";
+};
+Unattended-Upgrade::Automatic-Reboot "$([[ "$AUTO_REBOOT" == true ]] && printf true || printf false)";
+Unattended-Upgrade::Automatic-Reboot-Time "$REBOOT_TIME";
+Unattended-Upgrade::Automatic-Reboot-WithUsers "false";
+EOF
+}
+
+install_auto_updates() {
+    set_step "automatic updates (unattended-upgrades)"
+    if [[ "$ENABLE_MAINTENANCE" != true || "$AUTO_UPDATE" != true ]]; then
+        return 0
+    fi
+    if ! pkg_installed unattended-upgrades; then
+        if apt_install unattended-upgrades; then
+            CHANGES=$((CHANGES + 1))
+            log "installed unattended-upgrades"
+        else
+            log_warn "could not install unattended-upgrades — auto-updates skipped (soft-fail)"
+            return 0
+        fi
+    else
+        log "[ok] unattended-upgrades present"
+    fi
+    write_if_differs "$UATT_20" "$(uatt20_content)" "20auto-upgrades (unattended-upgrades)" 0644
+    if [[ -f "$UATT_50" ]] && ! grep -qF "$MAINT_MARKER" "$UATT_50"; then
+        # Unmanaged file (distro stock or hand-edited) — never clobbered,
+        # same hard-guard discipline as the sweep.
+        log_warn "existing UNMANAGED $UATT_50 left untouched — Automatic-Reboot settings may not apply"
+        return 0
+    fi
+    write_if_differs "$UATT_50" "$(uatt50_content)" "50unattended-upgrades (unattended-upgrades)" 0644
 }
 
 # ─────────────────────────────────────────────────────────────
@@ -2624,7 +3356,15 @@ SSH_KEY_FP=${SSH_KEY_FP:-}
 FAIL2BAN=$([[ "$ENABLE_FAIL2BAN" == true ]] && { [[ "$F2B_SKIPPED" == true ]] && printf skipped || printf enabled; } || printf disabled)
 UFW=$([[ "$UFW_SKIPPED" == true ]] && printf skipped || printf active)
 MAINTENANCE=$([[ "$ENABLE_MAINTENANCE" == true ]] && printf enabled || printf disabled)
+MAINT_ENABLED=$([[ "$ENABLE_MAINTENANCE" == true ]] && printf 1 || printf 0)
+MAINT_SCHEDULE=$([[ "$ENABLE_MAINTENANCE" == true ]] && printf '%s' "$MAINT_SCHEDULE" || printf '')
+MAINT_WEEKDAY=${MAINT_WEEKDAY}
+MAINT_MDAY=${MAINT_MDAY}
+MAINT_N_DAYS=${MAINT_N_DAYS}
 MAINT_TIME=${MAINT_HOUR}:${MAINT_MINUTE}
+AUTO_UPDATE=$([[ "$AUTO_UPDATE" == true ]] && printf 1 || printf 0)
+AUTO_REBOOT=$([[ "$AUTO_REBOOT" == true ]] && printf 1 || printf 0)
+REBOOT_TIME=${REBOOT_TIME}
 DOCKER=$DOCKER_RESULT
 DOCKER_USER=$([[ "$ENABLE_DOCKER" == true ]] && printf '%s' "$DOCKER_USER" || printf '')
 DOCKER_GROUP_ADDED=$DOCKER_GROUP_ADDED
@@ -2684,8 +3424,18 @@ verify_and_summarize() {
         echo "  Fail2ban        : not selected"
     fi
     if [[ "$ENABLE_MAINTENANCE" == true ]]; then
-        echo "  Maintenance     : weekly Sunday ${MAINT_HOUR}:${MAINT_MINUTE} (local only, never downloads; log: /var/log/crusty-maintenance.log)"
-        echo "  Reboot policy   : only when /var/run/reboot-required exists (+5 min grace)"
+        echo "  Maintenance     : $( [[ "$MAINT_SCHEDULE" == daily ]] && printf 'daily' || [[ "$MAINT_SCHEDULE" == weekly ]] && printf 'weekly %s' "$MAINT_WEEKDAY" || [[ "$MAINT_SCHEDULE" == monthly ]] && printf 'monthly day %s' "$MAINT_MDAY" || printf 'every %s days' "$MAINT_N_DAYS") at ${MAINT_HOUR}:${MAINT_MINUTE} (systemd timer, local only, never downloads)"
+        echo "                    log: $MAINT_LOG"
+        if [[ "$AUTO_UPDATE" == true ]]; then
+            echo "  Auto-updates    : unattended-upgrades enabled"
+        else
+            echo "  Auto-updates    : not installed"
+        fi
+        if [[ "$AUTO_REBOOT" == true ]]; then
+            echo "  Reboot policy   : auto-reboot scheduled at $REBOOT_TIME when required"
+        else
+            echo "  Reboot policy   : 'reboot required' logged only (no auto-reboot)"
+        fi
     else
         echo "  Maintenance     : not selected"
     fi
@@ -2754,7 +3504,13 @@ uninstall_plan() {
     echo ""
     echo "================ crusty UNINSTALL PLAN ================"
     echo "Will REMOVE (exactly what crusty owns):"
-    echo "  - $CRON_FILE (weekly maintenance cron)"
+    echo "  - $CRON_FILE (legacy v2.0 maintenance cron) + any crusty-signed"
+    echo "    root-crontab lines, cron.d/periodic files and crusty systemd"
+    echo "    units (the v2.1 stale sweep, without the keep-current guard)"
+    echo "  - $MAINT_UNIT_TIMER + $MAINT_UNIT_SERVICE + $MAINT_SCRIPT"
+    echo "    (v2.1 systemd maintenance scheduling)"
+    echo "  - $MAINT_RUN_STATE + $MAINT_LOG (maintenance runtime data)"
+    echo "  - unattended-upgrades config files (only if crusty-marked)"
     echo "  - $STATE_FILE (state file)"
     echo "  - $JAIL_LOCAL (only if it carries the crusty marker; backup restored if present)"
     if [[ -n "$u_port" ]]; then
@@ -2804,6 +3560,25 @@ do_uninstall() {
     local f
     for f in "$CRON_FILE" /etc/cron.d/crusty-auto-update /etc/cron.d/crusty-self-update /etc/cron.d/crusty-docker-prune; do
         [[ -f "$f" ]] && rm -f "$f" && log "removed $f"
+    done
+    # every remaining crusty scheduler leftover (sweep without the
+    # keep-current guard — nothing gets reinstalled after uninstall)
+    ENABLE_MAINTENANCE=false
+    sweep_stale_crusty
+    # 1b. v2.1 maintenance machinery + runtime data
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl disable --now crusty-maintenance.timer >/dev/null 2>&1 || true
+        systemctl disable --now crusty-maintenance.service >/dev/null 2>&1 || true
+    fi
+    for f in "$MAINT_UNIT_TIMER" "$MAINT_UNIT_SERVICE" "$MAINT_SCRIPT" "$MAINT_LOG"; do
+        [[ -e "$f" ]] && rm -f "$f" && log "removed $f"
+    done
+    [[ -d /var/lib/crusty ]] && rm -rf /var/lib/crusty && log "removed /var/lib/crusty"
+    # 1c. unattended-upgrades config — only files crusty wrote (marker)
+    for f in "$UATT_20" "$UATT_50"; do
+        if [[ -f "$f" ]] && grep -qF "$MAINT_MARKER" "$f"; then
+            rm -f "$f" && log "removed crusty-marked $f"
+        fi
     done
     [[ -d /opt/crusty-system ]] && rm -rf /opt/crusty-system && log "removed /opt/crusty-system"
     for f in /var/log/ssh-hardener.log /var/log/docker-setup.log; do
@@ -2930,6 +3705,7 @@ main() {
 
     wizard                 # collect EVERYTHING (9 prompts), no mutations yet
 
+    scan_stale_crusty      # read-only: fills the plan's sweep section
     plan_display
     if [[ "$DRY_RUN" == true ]]; then
         echo ""
@@ -2943,6 +3719,7 @@ main() {
     export DEBIAN_FRONTEND=noninteractive
 
     heal_v1_relics
+    sweep_stale_crusty     # FIRST so no old scheduler can coexist with the new one
     install_packages
     setup_admin_user
     setup_authorized_keys   # RP0: key verified BEFORE any restriction
@@ -2952,7 +3729,8 @@ main() {
     early_connect_banner
     configure_fail2ban
     apply_docker
-    write_cron
+    install_maintenance    # systemd timer + service + script (v2.1)
+    install_auto_updates   # unattended-upgrades + pinned config (v2.1)
     write_state
     verify_and_summarize
 }
