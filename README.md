@@ -30,18 +30,26 @@ sudo bash crusty.sh
 
 ## Wizard flow
 
-Preflight (OS + environment detection) → collect everything up front (≤8 prompts: admin user, password ×2, sudo, SSH key, port, modules, docker user, maintenance time) → plan display → final confirm → strictly non-interactive apply with `[+]` progress lines → summary with the connect string.
+Preflight (OS + environment detection) → collect everything up front (≤9 prompts: admin user, password ×2, sudo, SSH key, port, firewall, modules, docker user, maintenance time) → plan display → final confirm → strictly non-interactive apply with `[+]` progress lines → summary with the connect string.
 
 Log: `/var/log/crusty-install.log`.
 
 ## Flags
 
-A flag pre-fills its answer and skips its prompt. `--yes` takes defaults for the rest. **Headless runs (no TTY — `curl | bash`, CI) require `--user`, `--ssh-key` and `--yes`;** the account stays password-locked (key-only) by design in headless mode — there is no `--password` flag because argv leaks through `ps` and shell history.
+A flag pre-fills its answer and skips its prompt. `--yes` takes defaults for the rest. **Headless runs (no TTY — `curl | bash`, CI) require `--user` and `--yes`;** `--ssh-key` is required too unless the state file already records a valid key for the user (re-run convenience: a module-flip re-run never re-declares a key). The account stays password-locked (key-only) by design in headless mode — there is no `--password` flag because argv leaks through `ps` and shell history.
 
 ```
 --user NAME              admin user (refuses root; created if absent, reused if present)
---ssh-key KEY            public key (paste or path to a .pub file), validated
+--ssh-key KEY            public key (paste or path to a .pub file), validated;
+                         optional on re-runs when the state file records a valid key
+--sudo / --no-sudo       add the admin user to the 'sudo' group (interactive
+                         default: no in LXC, yes on VM/bare; re-runs pre-fill
+                         the previous choice)
 --port N                 SSH port, default 22
+--firewall / --no-firewall   UFW on top of any detected firewall stack
+                         (interactive pre-flight: warns and asks before layering
+                         UFW on a non-UFW stack; reviews existing rules and
+                         inbound listeners; --no-firewall skips UFW outright)
 --docker / --no-docker   Docker module (default: no)
 --docker-user NAME       docker group member (default: the admin user; implies --docker)
 --fail2ban / --no-fail2ban   default: yes
@@ -67,7 +75,7 @@ LXC notes:
 
 - **Docker in LXC** requires `features: nesting=1` (+ `keyctl=1` for unprivileged) in the pct config — set on the PVE host side, crusty can't fix it and prints the requirement.
 - **A container firewall protects the container, not the host.** The PVE/datacenter boundary is the real firewall; crusty prints this caveat on every container run.
-- `sudo` defaults to no inside containers (PVE console is the admin path); pass it interactively or rely on env defaults — there is deliberately no `--sudo` flag.
+- `sudo` defaults to no inside containers (PVE console is the admin path); pass it interactively or with `--sudo` / `--no-sudo`.
 
 ## Weekly maintenance cron
 
