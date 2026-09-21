@@ -1989,6 +1989,182 @@ heal_v1_relics() {
 }
 
 # ─────────────────────────────────────────────────────────────
+# STALE SWEEP (v2.1) — remove EVERY scheduler crusty ever installed:
+# v1 cron leftovers in ANY form, the v2.0 cron file, stray crusty systemd
+# units. HARD GUARD: only crusty-signed entries are removed — an unrelated
+# root-crontab line is listed in the plan as found-but-untouched (report
+# only). Runs FIRST in the apply phase so two schedulers can never
+# coexist, and honors --dry-run (the plan is the dry-run view).
+# ─────────────────────────────────────────────────────────────
+
+# Classify root-crontab lines read on stdin. Emits "D<TAB>line" (drop:
+# the line contains 'crusty') or "K<TAB>line" (keep: no crusty signature).
+# A dropped line ending in '\' carries its cron line-continuations with it.
+classify_crontab_lines() {
+    local dropcont=false
+    local line
+    while IFS= read -r line; do
+        if [[ "$dropcont" == true ]]; then
+            printf 'D\t%s\n' "$line"
+            [[ "$line" == *\\ ]] && dropcont=true || dropcont=false
+        elif [[ "$line" == *crusty* ]]; then
+            printf 'D\t%s\n' "$line"
+            [[ "$line" == *\\ ]] && dropcont=true || dropcont=false
+        else
+            dropcont=false
+            printf 'K\t%s\n' "$line"
+        fi
+    done
+}
+
+# Print the root crontab content on stdout; sets RC_SRC to the source
+# label ("file path" or "crontab(1)") — empty when there is no crontab.
+read_root_crontab() {
+    RC_SRC=""
+    if [[ -f "$ROOT_CRONTAB" ]]; then
+        RC_SRC="$ROOT_CRONTAB"
+        cat "$ROOT_CRONTAB"
+        return 0
+    fi
+    if command -v crontab >/dev/null 2>&1; then
+        local c
+        if c=$(crontab -u root -l 2>/dev/null); then
+            RC_SRC="crontab -u root -l"
+            printf '%s\n' "$c"
+        fi
+    fi
+    return 0
+}
+
+# A crusty unit that matches the exact content THIS run would install is
+# kept, not swept (re-run idempotency). Real implementation lives with the
+# timer/unit generators below; until then nothing matches (everything
+# crusty-signed is stale).
+is_current_crusty_unit() {
+    return 1
+}
+
+# Read-only scan of every crusty scheduler location. Fills SWEEP_REMOVE
+# ("KIND|PATH|description") and SWEEP_KEEP (report-only lines). Safe to
+# call at plan time and again at apply time.
+scan_stale_crusty() {
+    SWEEP_REMOVE=()
+    SWEEP_KEEP=()
+    local content src line kind p f base
+    # a) root crontab — ANY line containing 'crusty' (v1 wrote
+    #    crusty-update / crusty updater / crusty-maintenance in all forms)
+    src=""
+    content=$(read_root_crontab)
+    src="$RC_SRC"
+    if [[ -n "$src" ]]; then
+        while IFS=$'\t' read -r kind line; do
+            if [[ "$kind" == "D" ]]; then
+                SWEEP_REMOVE+=("cron-root|$src|crusty crontab entry: ${line:0:70}")
+            elif [[ "$line" != "#"* && -n "$line" ]]; then
+                SWEEP_KEEP+=("$src: ${line:0:70}")
+            fi
+        done < <(classify_crontab_lines <<< "$content")
+    fi
+    # b) /etc/cron.d/crusty* (v1: crusty-auto-update/-self-update/
+    #    -docker-prune; v2.0: crusty-maintenance)
+    for p in "$CRON_D_DIR"/*crusty*; do
+        [[ -e "$p" || -L "$p" ]] && SWEEP_REMOVE+=("cron.d|$p|stale crusty cron.d file")
+    done
+    # c) periodic run-parts dirs
+    for p in "$CRON_DAILY_DIR"/crusty* "$CRON_WEEKLY_DIR"/crusty* "$CRON_MONTHLY_DIR"/crusty*; do
+        [[ -e "$p" || -L "$p" ]] && SWEEP_REMOVE+=("cron-periodic|$p|stale crusty periodic job")
+    done
+    # d) systemd (defensive — v1 used cron): crusty*.timer / crusty*.service
+    #    EXCEPT the exact units this run would install (idempotency)
+    for f in "$SYSTEMD_DIR"/crusty*.timer "$SYSTEMD_DIR"/crusty*.service; do
+        [[ -e "$f" || -L "$f" ]] || continue
+        if [[ -f "$f" ]] && is_current_crusty_unit "$f"; then
+            continue
+        fi
+        base=$(basename "$f")
+        SWEEP_REMOVE+=("systemd|$f|stale crusty systemd unit ($base)")
+    done
+    return 0
+}
+
+# Apply the sweep. Re-scans first so it acts on the live state, not the
+# plan snapshot taken minutes earlier.
+sweep_stale_crusty() {
+    set_step "stale crusty scheduler sweep"
+    scan_stale_crusty
+    local entry kind path desc base w
+    local root_done=""
+    for entry in "${SWEEP_REMOVE[@]:-}"; do
+        [[ -z "$entry" ]] && continue
+        IFS='|' read -r kind path desc <<< "$entry"
+        case "$kind" in
+            cron-root)
+                if [[ "$root_done" != "$path" ]]; then
+                    root_done="$path"
+                    sweep_root_crontab_apply "$path"
+                fi
+                ;;
+            cron.d|cron-periodic)
+                rm -f "$path"
+                CHANGES=$((CHANGES + 1))
+                log "swept: removed stale crusty cron file $path"
+                ;;
+            systemd)
+                base=$(basename "$path")
+                if command -v systemctl >/dev/null 2>&1; then
+                    systemctl disable --now "$base" >/dev/null 2>&1 || true
+                fi
+                rm -f "$path"
+                CHANGES=$((CHANGES + 1))
+                log "swept: removed stale crusty systemd unit $path"
+                ;;
+        esac
+    done
+    # leftover enable symlinks (unit file already gone, wants-link left)
+    for w in "$SYSTEMD_DIR"/*.wants/crusty* "$SYSTEMD_DIR"/*.requires/crusty*; do
+        if [[ -L "$w" ]]; then
+            rm -f "$w"
+            CHANGES=$((CHANGES + 1))
+            log "swept: removed stale crusty enable symlink $w"
+        fi
+    done
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl daemon-reload >/dev/null 2>&1 || true
+    fi
+}
+
+# Rewrite the root crontab without its crusty entries, preserving every
+# unrelated line byte-for-byte. Spool file: preserve mode/owner, atomic
+# move. crontab(1) source: install via `crontab -u root`.
+sweep_root_crontab_apply() {
+    local src="$1" content tmp kept=0 line
+    content=$(read_root_crontab)
+    if [[ -z "$RC_SRC" ]]; then
+        return 0    # vanished between scan and apply — nothing to do
+    fi
+    tmp=$(mktemp "${ROOT_CRONTAB}.sweep.XXXXXX")
+    while IFS= read -r line; do
+        printf '%s\n' "$line" >> "$tmp"
+        kept=$((kept + 1))
+    done < <(classify_crontab_lines <<< "$content" | awk -F'\t' '$1 == "K" { print substr($0, 3) }')
+    if [[ "$RC_SRC" == "$ROOT_CRONTAB" ]]; then
+        chown --reference="$ROOT_CRONTAB" "$tmp" 2>/dev/null || true
+        chmod --reference="$ROOT_CRONTAB" "$tmp" 2>/dev/null || chmod 0600 "$tmp"
+        mv -f "$tmp" "$ROOT_CRONTAB"
+    else
+        if crontab -u root "$tmp" 2>/dev/null; then
+            rm -f "$tmp"
+        else
+            rm -f "$tmp"
+            log_warn "could not rewrite the root crontab via crontab(1) — entries left as-is"
+            return 0
+        fi
+    fi
+    CHANGES=$((CHANGES + 1))
+    log "swept: removed crusty entries from the root crontab ($kept unrelated line(s) kept)"
+}
+
+# ─────────────────────────────────────────────────────────────
 # Apply: packages
 # ─────────────────────────────────────────────────────────────
 
@@ -3096,7 +3272,13 @@ uninstall_plan() {
     echo ""
     echo "================ crusty UNINSTALL PLAN ================"
     echo "Will REMOVE (exactly what crusty owns):"
-    echo "  - $CRON_FILE (weekly maintenance cron)"
+    echo "  - $CRON_FILE (legacy v2.0 maintenance cron) + any crusty-signed"
+    echo "    root-crontab lines, cron.d/periodic files and crusty systemd"
+    echo "    units (the v2.1 stale sweep, without the keep-current guard)"
+    echo "  - $MAINT_UNIT_TIMER + $MAINT_UNIT_SERVICE + $MAINT_SCRIPT"
+    echo "    (v2.1 systemd maintenance scheduling)"
+    echo "  - $MAINT_RUN_STATE + $MAINT_LOG (maintenance runtime data)"
+    echo "  - unattended-upgrades config files (only if crusty-marked)"
     echo "  - $STATE_FILE (state file)"
     echo "  - $JAIL_LOCAL (only if it carries the crusty marker; backup restored if present)"
     if [[ -n "$u_port" ]]; then
@@ -3146,6 +3328,25 @@ do_uninstall() {
     local f
     for f in "$CRON_FILE" /etc/cron.d/crusty-auto-update /etc/cron.d/crusty-self-update /etc/cron.d/crusty-docker-prune; do
         [[ -f "$f" ]] && rm -f "$f" && log "removed $f"
+    done
+    # every remaining crusty scheduler leftover (sweep without the
+    # keep-current guard — nothing gets reinstalled after uninstall)
+    ENABLE_MAINTENANCE=false
+    sweep_stale_crusty
+    # 1b. v2.1 maintenance machinery + runtime data
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl disable --now crusty-maintenance.timer >/dev/null 2>&1 || true
+        systemctl disable --now crusty-maintenance.service >/dev/null 2>&1 || true
+    fi
+    for f in "$MAINT_UNIT_TIMER" "$MAINT_UNIT_SERVICE" "$MAINT_SCRIPT" "$MAINT_LOG"; do
+        [[ -e "$f" ]] && rm -f "$f" && log "removed $f"
+    done
+    [[ -d /var/lib/crusty ]] && rm -rf /var/lib/crusty && log "removed /var/lib/crusty"
+    # 1c. unattended-upgrades config — only files crusty wrote (marker)
+    for f in "$UATT_20" "$UATT_50"; do
+        if [[ -f "$f" ]] && grep -qF "$MAINT_MARKER" "$f"; then
+            rm -f "$f" && log "removed crusty-marked $f"
+        fi
     done
     [[ -d /opt/crusty-system ]] && rm -rf /opt/crusty-system && log "removed /opt/crusty-system"
     for f in /var/log/ssh-hardener.log /var/log/docker-setup.log; do
@@ -3272,6 +3473,7 @@ main() {
 
     wizard                 # collect EVERYTHING (9 prompts), no mutations yet
 
+    scan_stale_crusty      # read-only: fills the plan's sweep section
     plan_display
     if [[ "$DRY_RUN" == true ]]; then
         echo ""
@@ -3285,6 +3487,7 @@ main() {
     export DEBIAN_FRONTEND=noninteractive
 
     heal_v1_relics
+    sweep_stale_crusty     # FIRST so no old scheduler can coexist with the new one
     install_packages
     setup_admin_user
     setup_authorized_keys   # RP0: key verified BEFORE any restriction
