@@ -811,6 +811,7 @@ wizard() {
     )
     local i=0 rc=0
     while (( i < ${#steps[@]} )); do
+        rc=0   # reset every iteration: `|| rc=$?` only assigns on nonzero
         "${steps[$i]}" || rc=$?
         case $rc in
             0)   i=$((i + 1)) ;;
