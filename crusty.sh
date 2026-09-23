@@ -127,7 +127,7 @@ OLD_DGROUP_ADDED=""
 _emit() {
     local marker="$1"
     shift
-    printf '%s %s\n' "$marker" "$*"
+    printf '%s %s\n' "$marker" "$*" || true
     if [[ $EUID -eq 0 ]]; then
         printf '%s %s\n' "$marker" "$*" >> "$INSTALL_LOG" 2>/dev/null || true
     fi
@@ -162,7 +162,7 @@ set_step() {
 on_error() {
     local rc=$?
     trap - ERR
-    log_error "FAILED (rc=$rc) during step: $CURRENT_STEP"
+    log_error "FAILED (rc=$rc) during step: $CURRENT_STEP (line ${BASH_LINENO[0]:-?}: ${BASH_COMMAND:-?})"
     log_error "Last log lines ($INSTALL_LOG):"
     tail -n 10 "$INSTALL_LOG" 2>/dev/null | sed 's/^/      /' >&2 || true
     exit "$rc"
