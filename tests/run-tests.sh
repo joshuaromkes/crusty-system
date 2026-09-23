@@ -8,6 +8,10 @@
 #   6. keep-key re-run = zero changes; per-module delta idempotency
 #   7. firewall pre-flight (round-4): stack detection, rule review/remove,
 #      inbound-listener allow, no-layering warning, converged re-run reuse
+#   8. skip/idempotency contract (approved spec): blank-to-default on the
+#      whiptail input path (D1), state prefill + keep-gate (D3), docker-user
+#      default (D4), password skip NEVER calls chpasswd, skip-on-every-prompt
+#      resolves to the recorded state, and a full dry-run re-run is identical
 #
 # Pure-function tests never need root; the PTY signal test needs `script`
 # and `whiptail` (installed in CI; skipped with a note when absent).
@@ -103,6 +107,7 @@ crusty_globals() {
     FW_ALLOW_EXTRA=(); FW_REMOVE_RULES=()
     OLD_FW_STACK=""; OLD_FW_ACK=""; OLD_FW_EXTRA_ALLOW=""
     OLD_TARGET_USER=""; OLD_SUDO=""; OLD_SSH_PORT=""; OLD_SSH_KEY_FP=""; OLD_MAINT_TIME=""
+    OLD_FAIL2BAN=""; OLD_MAINTENANCE=""; OLD_DOCKER=""; OLD_DOCKER_USER=""
     STATE_FILE="/etc/crusty.conf"
     CHANGES=0; KEY_MAX_LEN=4096
     CURRENT_SSH_PORTS=(22); SSH_PORT=22
@@ -796,7 +801,315 @@ else
 fi
 
 # ----------------------------------------------------------------------------
-section "8. set -e landmine regression (real wizard + real prompts)"
+section "8. skip/idempotency contract (approved spec)"
+# The uniform skip contract (S1): blank/untouched + OK = keep the recorded
+# value; skipped fields NEVER change state; an identical re-run resolves the
+# same plan (L2). Regression tests for D1-D4 + password skip.
+
+# 8a. D1 — the whiptail ui_input path resolves blank + OK to the default
+# (parity with the plain-read fallback at crusty.sh:566); a typed value
+# passes through; rc 1/2 (Back/Esc) are untouched.
+( stub_log
+  source <("$EXTRACT" ui_input)
+  USE_WHIPTAIL=true
+  ui_box() { return 0; }                       # empty input = untouched
+  [[ "$(ui_input t x recorded)" == recorded ]]
+) && ok || fail "D1 whiptail ui_input blank must resolve to the default"
+( stub_log
+  source <("$EXTRACT" ui_input)
+  USE_WHIPTAIL=true
+  ui_box() { printf '%s' typed99; return 0; }
+  [[ "$(ui_input t x recorded)" == typed99 ]]
+) && ok || fail "D1 whiptail ui_input typed value passes through"
+( stub_log
+  source <("$EXTRACT" ui_input)
+  USE_WHIPTAIL=true
+  ui_box() { return 1; }
+  ui_input t x d
+  [[ $? == 1 ]]
+) && ok || fail "D1 ui_input Cancel must return back (rc 1)"
+( stub_log
+  source <("$EXTRACT" ui_input)
+  USE_WHIPTAIL=true
+  ui_box() { return 255; }
+  ui_input t x d
+  [[ $? == 2 ]]
+) && ok || fail "D1 ui_input Esc must return quit (rc 2)"
+
+# 8b. D2 — load_state reads the module keys (FAIL2BAN/MAINTENANCE/DOCKER/
+# DOCKER_USER) into OLD_ vars so the wizard can prefill from them.
+cat > "$TMP/state8.conf" <<'EOF'
+# crusty-system state — fixture
+TARGET_USER=josh
+SSH_PORT=2222
+FAIL2BAN=disabled
+MAINTENANCE=enabled
+DOCKER=enabled
+DOCKER_USER=josh
+MAINT_TIME=04:30
+FW_ACK=no
+EOF
+( stub_log
+  crusty_globals
+  STATE_FILE="$TMP/state8.conf"
+  source <("$EXTRACT" load_state)
+  load_state
+  [[ "$OLD_TARGET_USER" == josh && "$OLD_SSH_PORT" == 2222 \
+     && "$OLD_FAIL2BAN" == disabled && "$OLD_MAINTENANCE" == enabled \
+     && "$OLD_DOCKER" == enabled && "$OLD_DOCKER_USER" == josh \
+     && "$OLD_MAINT_TIME" == 04:30 ]]
+) && ok || fail "D2 load_state must read the module keys into OLD_ vars"
+
+# 8c. D3 — whiptail checklist prefills from the recorded state and an
+# untouched OK keeps the recorded set (S1). The pitfall guard re-confirms
+# ONLY on an empty selection when the record had fail2ban and/or maintenance
+# ON — a recorded both-OFF set must not false-positive.
+# 8c-i. recorded enabled/enabled/disabled + untouched OK -> recorded flags
+( stub_log
+  crusty_globals
+  USE_WHIPTAIL=true
+  OLD_FAIL2BAN=enabled; OLD_MAINTENANCE=enabled; OLD_DOCKER=disabled
+  ui_box() {
+      printf 'FB_%s MN_%s DN_%s\n' "${10:-?}" "${13:-?}" "${16:-?}" > "$TMP/check8i.txt"
+      printf '%s' "fail2ban maintenance"      # untouched: the recorded ONs
+      return 0
+  }
+  source <("$EXTRACT" prompt_modules)
+  prompt_modules
+  [[ "$ENABLE_FAIL2BAN" == true && "$ENABLE_MAINTENANCE" == true \
+     && "$ENABLE_DOCKER" != true && "$(cat "$TMP/check8i.txt")" == "FB_ON MN_ON DN_OFF" ]]
+) && ok || fail "D3 checklist must prefill from state; untouched OK keeps the set"
+
+# 8c-ii. recorded ON set + EMPTY selection (no toggle registered) -> the
+# guard re-asks; operator confirms -> both stay OFF, step completes
+( stub_log
+  crusty_globals
+  USE_WHIPTAIL=true
+  OLD_FAIL2BAN=enabled; OLD_MAINTENANCE=enabled; OLD_DOCKER=disabled
+  yesno_calls=0
+  ui_box() { return 0; }                       # EMPTY selection
+  ui_yesno() { yesno_calls=$((yesno_calls + 1)); return 0; }   # Yes: proceed disabled
+  source <("$EXTRACT" prompt_modules)
+  prompt_modules
+  [[ "$yesno_calls" == 1 && "$ENABLE_FAIL2BAN" != true && "$ENABLE_MAINTENANCE" != true ]]
+) && ok || fail "D3 empty selection on recorded-ON set must re-confirm"
+
+# 8c-iii. recorded both-OFF + empty OK = operator KEEPING that -> no re-ask
+# (the spec's false-positive case: a prior run already recorded both OFF)
+( stub_log
+  crusty_globals
+  USE_WHIPTAIL=true
+  OLD_FAIL2BAN=disabled; OLD_MAINTENANCE=disabled; OLD_DOCKER=disabled
+  yesno_calls=0
+  ui_box() { return 0; }                       # untouched keep of an all-OFF prefill
+  ui_yesno() { yesno_calls=$((yesno_calls + 1)); return 0; }
+  source <("$EXTRACT" prompt_modules)
+  prompt_modules
+  [[ "$yesno_calls" == 0 && "$ENABLE_FAIL2BAN" != true \
+     && "$ENABLE_MAINTENANCE" != true && "$ENABLE_DOCKER" != true ]]
+) && ok || fail "D3 recorded both-OFF + empty OK must NOT re-ask (keep)"
+
+# 8d. D3 — plain-read fallback keep-gate: recorded set + Enter (Y) keeps it
+# with ONE yes/no; answering No opens the three sub-questions at the RECORDED
+# defaults, so changing one module never flips the other two.
+( stub_log
+  crusty_globals
+  USE_WHIPTAIL=false
+  OLD_FAIL2BAN=enabled; OLD_MAINTENANCE=disabled; OLD_DOCKER=enabled
+  asks=0
+  ui_yesno() { asks=$((asks + 1)); return 0; }   # keep-gate: Yes (keep)
+  source <("$EXTRACT" prompt_modules)
+  prompt_modules
+  [[ "$asks" == 1 && "$ENABLE_FAIL2BAN" == true && "$ENABLE_MAINTENANCE" != true \
+     && "$ENABLE_DOCKER" == true ]]
+) && ok || fail "D3 read fallback keep-gate Yes keeps the recorded set"
+
+# 8d-ii. keep-gate No -> sub-questions start from recorded answers; flipping
+# only docker (recorded no -> yes) leaves f2b=ON and maintenance=OFF
+( stub_log
+  crusty_globals
+  USE_WHIPTAIL=false
+  OLD_FAIL2BAN=enabled; OLD_MAINTENANCE=disabled; OLD_DOCKER=disabled
+  answers=(1 0 1 0)   # keep-gate No; f2b keep(yes); maint keep(no); docker yes
+  i=0
+  ui_yesno() {
+      printf 'D:%s\n' "$3" >> "$TMP/read8d.txt"
+      local a="${answers[$i]:-0}"; i=$((i + 1)); return "$a"
+  }
+  source <("$EXTRACT" prompt_modules)
+  prompt_modules
+  r=$(cat "$TMP/read8d.txt")
+  [[ "$ENABLE_FAIL2BAN" == true && "$ENABLE_MAINTENANCE" != true \
+     && "$ENABLE_DOCKER" == true ]] \
+      && printf '%s' "$r" | grep -q '^D:yes$' && printf '%s' "$r" | grep -q '^D:no$'
+) && ok || fail "D3 read fallback keep-gate No starts sub-questions at recorded answers"
+
+# 8e. D4 — prompt_docker_user defaults to the RECORDED docker user on both
+# the interactive path (pre-filled box) and the --yes path, not TARGET_USER.
+( stub_log
+  crusty_globals
+  ENABLE_DOCKER=true
+  TARGET_USER=zoe
+  OLD_DOCKER_USER=alice
+  ui_input() { printf '%s\n' "$3" > "$TMP/dock8e.txt"; printf '%s' "$3"; }
+  source <("$EXTRACT" validate_username)
+  source <("$EXTRACT" prompt_docker_user)
+  prompt_docker_user
+  [[ "$DOCKER_USER" == alice && "$(cat "$TMP/dock8e.txt")" == alice ]]
+) && ok || fail "D4 interactive docker user must default to the recorded user"
+( stub_log
+  crusty_globals
+  ENABLE_DOCKER=true
+  TARGET_USER=zoe
+  OLD_DOCKER_USER=alice
+  ASSUME_YES=true
+  source <("$EXTRACT" prompt_docker_user)
+  prompt_docker_user
+  [[ "$DOCKER_USER" == alice ]]
+) && ok || fail "D4 --yes docker user must keep the recorded user"
+
+# 8f. password skip — both fields empty + OK => SET_PASSWORD stays empty
+( stub_log
+  crusty_globals
+  HAVE_TTY=true
+  ui_password() { return 0; }       # both boxes read empty
+  source <("$EXTRACT" prompt_password)
+  prompt_password
+  [[ -z "$SET_PASSWORD" ]]
+) && ok || fail "blank-blank password prompt must skip (SET_PASSWORD empty)"
+
+# 8g. S1 — skipping EVERY prompt (blank boxes, Enter on the highlighted
+# past choice, menu keep) resolves every field to the recorded value, i.e.
+# existing state untouched. This is the decision logic a full interactive
+# re-run exercises.
+( stub_log
+  crusty_globals
+  HAVE_TTY=true
+  OLD_TARGET_USER=crustytest; OLD_SSH_PORT=2222; OLD_MAINT_TIME=04:30
+  OLD_SUDO=yes; OLD_FAIL2BAN=enabled; OLD_MAINTENANCE=enabled
+  OLD_DOCKER=enabled; OLD_DOCKER_USER=alice
+  # NOTE: no module flags are pre-set — prompt_modules must resolve the
+  # recorded set through the keep-gate (ENABLE_DOCKER is set by it, which is
+  # also what lets prompt_docker_user run afterwards).
+  ui_input()   { printf '%s' "$3"; }    # untouched box returns its prefill
+  ui_password(){ return 0; }            # blank + OK = skip
+  ui_yesno()   { return 0; }            # Enter on the highlighted default
+  ui_menu()    { printf 'keep\n'; }     # keep menu item (keys)
+  source_funcs validate_username validate_port validate_time >/dev/null
+  source <("$EXTRACT" prompt_user)
+  source <("$EXTRACT" prompt_password)
+  source <("$EXTRACT" prompt_sudo)
+  source <("$EXTRACT" prompt_port)
+  source <("$EXTRACT" prompt_modules)
+  source <("$EXTRACT" prompt_docker_user)
+  source <("$EXTRACT" prompt_maint_time)
+  prompt_user
+  prompt_password
+  prompt_sudo
+  prompt_port
+  prompt_modules
+  prompt_docker_user
+  prompt_maint_time
+  [[ "$TARGET_USER" == crustytest && "$SSH_PORT" == 2222 \
+     && "${MAINT_HOUR}:${MAINT_MINUTE}" == 04:30 \
+     && "$GRANT_SUDO" == yes && -z "$SET_PASSWORD" \
+     && "$DOCKER_USER" == alice \
+     && "$ENABLE_FAIL2BAN" == true && "$ENABLE_MAINTENANCE" == true \
+     && "$ENABLE_DOCKER" == true ]]
+) && ok || fail "skip on every prompt must resolve to the recorded state"
+
+# 8h. password skipped => chpasswd is NEVER called (existing password
+# untouched — the apply-side gate in setup_admin_user)
+# NOTE: chpasswd is invoked as the right side of a pipe, so the spy must
+# count via a FILE (a variable increment inside a pipeline subshell would
+# never reach the caller).
+( stub_log
+  crusty_globals
+  source <("$EXTRACT" setup_admin_user)
+  source <("$EXTRACT" die)
+  TARGET_USER=root                       # exists everywhere; id/getent real
+  SET_PASSWORD=""
+  GRANT_SUDO=""
+  OLD_CREATED_USER=""
+  CHANGES=0
+  rm -f "$TMP/chpw8h.txt"
+  chpasswd() { echo CALLED >> "$TMP/chpw8h.txt"; }   # spy: record any call
+  setup_admin_user
+  [[ "$CHANGES" == 0 && ! -f "$TMP/chpw8h.txt" ]]
+) && ok || fail "password skipped must NOT call chpasswd"
+# ...and the positive control: a set password reaches chpasswd via stdin
+( stub_log
+  crusty_globals
+  source <("$EXTRACT" setup_admin_user)
+  source <("$EXTRACT" die)
+  TARGET_USER=root
+  SET_PASSWORD="s3cret"
+  GRANT_SUDO=""
+  OLD_CREATED_USER=""
+  CHANGES=0
+  rm -f "$TMP/chpw8h.txt"
+  chpasswd() { echo CALLED >> "$TMP/chpw8h.txt"; }   # spy: record any call
+  setup_admin_user
+  [[ "$(wc -l < "$TMP/chpw8h.txt")" == 1 && "$CHANGES" == 1 ]]
+) && ok || fail "a supplied password MUST call chpasswd exactly once"
+
+# 8i. L2 — a full dry-run re-run resolves the SAME plan from the recorded
+# state (identical re-run = zero changes would apply). Runs the REAL script
+# end-to-end with --dry-run --yes against a seeded state file; the plan must
+# be byte-identical across both runs and show the recorded module set
+# (state-aware --yes defaults + D2/D3/D4 prefill). No root required: with
+# passwordless sudo we run as root (env preserved via the VAR= prefix);
+# without it, ensure_root's dry-run limited-state path keeps the env.
+E2E_STATE="$TMP/state-e2e.conf"
+cat > "$E2E_STATE" <<'EOF'
+# crusty-system state — seeded fixture (as a previous real run would write)
+TARGET_USER=crustytest
+SSH_PORT=2222
+SUDO=yes
+SUDO_ADDED=1
+FAIL2BAN=disabled
+MAINTENANCE=disabled
+DOCKER=enabled
+DOCKER_USER=alice
+MAINT_TIME=04:30
+FW_STACK=none
+FW_ACK=no
+EOF
+e2e_run() {  # $1 = out file
+    if sudo -n true 2>/dev/null; then
+        sudo -n CRUSTY_STATE_FILE="$E2E_STATE" CRUSTY_INSTALL_LOG="$TMP/install-e2e.log" \
+            bash "$ROOT/crusty.sh" --dry-run --yes --user crustytest --ssh-key "$KEY_A" \
+            > "$1" 2>&1
+    else
+        CRUSTY_STATE_FILE="$E2E_STATE" CRUSTY_INSTALL_LOG="$TMP/install-e2e.log" \
+            bash "$ROOT/crusty.sh" --dry-run --yes --user crustytest --ssh-key "$KEY_A" \
+            > "$1" 2>&1
+    fi
+}
+e2e_run "$TMP/e2e-1.out"; rc1=$?
+e2e_run "$TMP/e2e-2.out"; rc2=$?
+if [[ "$rc1" == 0 && "$rc2" == 0 ]]; then
+    plan1="$(awk '/crusty PLAN/{f=1;next} /^=+$/{f=0} f' "$TMP/e2e-1.out")"
+    plan2="$(awk '/crusty PLAN/{f=1;next} /^=+$/{f=0} f' "$TMP/e2e-2.out")"
+    if [[ "$plan1" == "$plan2" ]] \
+       && printf '%s' "$plan2" | grep -q 'MODULES.*fail2ban=OFF maintenance=OFF docker=ON' \
+       && printf '%s' "$plan2" | grep -q 'Docker user.*alice (added to the docker group)' \
+       && printf '%s' "$plan2" | grep -q 'Maintenance cron.*no' \
+       && printf '%s' "$plan2" | grep -q 'SSH port.*-> 2222'; then
+        ok
+    else
+        echo "  DBG rc1=$rc1 rc2=$rc2"
+        echo "  DBG plan2=[$plan2]"
+        fail "dry-run re-run must resolve the recorded state (identical plans)"
+    fi
+else
+    echo "  (dry-run harness exit rc1=$rc1 rc2=$rc2; full output in $TMP/e2e-1.out)"
+    fail "dry-run re-run exited nonzero ($rc1/$rc2)"
+fi
+
+
+# ----------------------------------------------------------------------------
+section "9. set -e landmine regression (real wizard + real prompts)"
 # The landmine class: a BARE `ui_yesno; rc=$?` (missing `||`) aborts the whole
 # script under `set -Eeuo pipefail` on ANY nonzero dialog answer (No=1,
 # Esc=2, Back=1). Section 2 tested the loop with ALL steps stubbed; here the
@@ -994,7 +1307,6 @@ if [[ -n "$DRY_SSH_KEY" ]]; then
 else
     echo "  (ssh-keygen unavailable — dry-run re-run test skipped)"
 fi
-
 # ----------------------------------------------------------------------------
 echo
 echo "=========================================================="

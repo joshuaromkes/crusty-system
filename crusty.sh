@@ -140,6 +140,10 @@ OLD_DGROUP_ADDED=""
 OLD_FW_STACK=""          # firewall stack detected at the previous run
 OLD_FW_EXTRA_ALLOW=""    # listeners allowed in a previous run (re-run pre-fill)
 OLD_FW_ACK=""            # previous run's layering acknowledgment (yes/no)
+OLD_FAIL2BAN=""          # recorded module states (enabled/disabled/skipped|failed) —
+OLD_MAINTENANCE=""       #   checklist prefill (D3) / --yes keep-set (L2)
+OLD_DOCKER=""
+OLD_DOCKER_USER=""       # recorded docker group member — re-run default (D4)
 
 # ─────────────────────────────────────────────────────────────
 # Logging + traps
@@ -545,7 +549,9 @@ ui_key_width() {
     printf '%s' "$w"
 }
 
-# ui_input TITLE TEXT DEFAULT [WIDTH] -> echoes the answer. rc 0 = ok,
+# ui_input TITLE TEXT DEFAULT [WIDTH] -> echoes the answer. A blank/untouched
+# box resolves to DEFAULT on BOTH UI paths — the skip contract (S1): OK
+# without typing keeps the current value. rc 0 = ok,
 # rc 1 = back (Cancel), rc 2 = quit (Esc / 'quit' in the read fallback).
 ui_input() {
     local title="$1" text="$2" default="$3" width="${4:-58}" out rc=0
@@ -556,7 +562,7 @@ ui_input() {
             return 2   # Esc: quit the wizard, zero changes
         fi
         (( rc != 0 )) && return 1
-        printf '%s' "$out"
+        printf '%s' "${out:-$default}"   # blank + OK = keep the default (D1)
         return 0
     fi
     printf '%s\n[%s] (enter ok, "quit" cancels): ' "$text" "$default" > /dev/tty
@@ -576,7 +582,7 @@ ui_input() {
 ui_password() {
     local title="$1" text="$2" out rc=0
     if [[ "$USE_WHIPTAIL" == true ]]; then
-        out=$(ui_box --title "$title" --passwordbox "$text" 10 58 \
+        out=$(ui_box --title "$title" --passwordbox "$text" 12 58 \
                      --ok-button "OK" --cancel-button "Back") || rc=$?
         if (( rc == 255 )); then
             return 2
@@ -789,6 +795,10 @@ load_state() {
                 FW_STACK)             OLD_FW_STACK="$val" ;;
                 FW_EXTRA_ALLOW)       OLD_FW_EXTRA_ALLOW="$val" ;;
                 FW_ACK)               OLD_FW_ACK="$val" ;;
+                FAIL2BAN)             OLD_FAIL2BAN="$val" ;;
+                MAINTENANCE)          OLD_MAINTENANCE="$val" ;;
+                DOCKER)               OLD_DOCKER="$val" ;;
+                DOCKER_USER)          OLD_DOCKER_USER="$val" ;;
             esac
         done < "$STATE_FILE"
         log_note "previous crusty state found (user=${OLD_TARGET_USER:-?}, port=${OLD_SSH_PORT:-?})"
@@ -844,10 +854,15 @@ prompt_user() {
         return 0
     fi
     local default="${SUDO_USER:-${OLD_TARGET_USER:-admin}}"
+    local hint="Leave blank to accept the default."
+    if [[ -n "$OLD_TARGET_USER" ]]; then
+        hint="Leave as-is + OK to keep using '${OLD_TARGET_USER}'."
+    fi
     local answer rc=0
     while true; do
         answer=$(ui_input "Admin user" \
-            "Dedicated non-root admin user. Created if absent, reused if present. Never root (C1)." \
+            "Dedicated non-root admin user. Created if absent, reused if present. Never root (C1).
+$hint" \
             "$default") || rc=$?
         case $rc in
             2) return 2 ;;
@@ -880,13 +895,16 @@ prompt_password() {
     local p1 p2 rc=0
     while true; do
         p1=$(ui_password "Password (1/2)" \
-            "Set a password for the admin user.
-Leave EMPTY to skip (new/locked accounts become key-only; existing passwords are NOT touched).") || rc=$?
+            "Set a password for '$TARGET_USER'.
+LEAVE BOTH FIELDS EMPTY + OK TO SKIP.
+An EXISTING password is NEVER touched by this script;
+a new/locked account stays locked and key-only.") || rc=$?
         case $rc in
             2) return 2 ;;
             1) return 1 ;;
         esac
-        p2=$(ui_password "Password (2/2)" "Repeat the password (must match).") || rc=$?
+        p2=$(ui_password "Password (2/2)" "Repeat the password (must match).
+Leave BOTH fields empty + OK to skip — nothing is changed.") || rc=$?
         case $rc in
             2) return 2 ;;
             1) return 1 ;;
@@ -922,7 +940,8 @@ prompt_sudo() {
     local text
     text="Add '$TARGET_USER' to the 'sudo' group?
 (LXC default: no — the PVE console is the admin path.
-VM/bare-metal default: yes.)"
+VM/bare-metal default: yes.)
+Press Enter on the highlighted choice to keep it — no change."
     ui_yesno "Sudo access" "$text" "$def" || rc=$?
     case $rc in
         2) return 2 ;;
@@ -938,7 +957,8 @@ paste_key_prompt() {
     while true; do
         answer=$(ui_input "SSH public key" \
             "Paste your SSH PUBLIC key (ssh-ed25519 AAAA... user@host) or a path to a .pub file.
-A key is REQUIRED: password auth will be disabled." \
+No key exists on this box and password auth will be disabled,
+so this step CANNOT be skipped. Back = previous step, Esc = quit, zero changes." \
             "" "$(ui_key_width)") || rc=$?
         case $rc in
             2) return 2 ;;
@@ -1023,7 +1043,8 @@ key_management_menu() {
     local rc=0 choice
     while true; do
         choice=$(ui_menu "SSH keys" \
-            "Manage installed keys for '$TARGET_USER' (re-run keep/add/view/remove):" \
+            "Manage installed keys for '$TARGET_USER' (re-run keep/add/view/remove):
+Choosing keep changes nothing." \
             keep   "Keep existing key(s) — no changes" \
             add    "Add a new key (paste another)" \
             view   "View installed keys" \
@@ -1099,7 +1120,8 @@ prompt_port() {
     while true; do
         answer=$(ui_input "SSH port" \
             "SSH port to listen on (current: ${CURRENT_SSH_PORTS[*]}).
-22 is fine behind a parent firewall (PVE/WireGuard); a custom port only adds obscurity. 80/443 are refused." \
+22 is fine behind a parent firewall (PVE/WireGuard); a custom port only adds obscurity. 80/443 are refused.
+Leave as-is + OK to keep $default — nothing is changed." \
             "$default") || rc=$?
         case $rc in
             2) return 2 ;;
@@ -1137,16 +1159,46 @@ prompt_modules() {
         return 0    # at least one module flag given — defaults cover the rest
     fi
     if [[ "$ASSUME_YES" == true ]]; then
+        # --yes: KEEP the recorded module set on re-runs (L2 — an identical
+        # re-run must resolve the same flags the state was written from);
+        # the fresh defaults apply only when no prior state exists.
+        if [[ -n "$OLD_FAIL2BAN" || -n "$OLD_MAINTENANCE" || -n "$OLD_DOCKER" ]]; then
+            ENABLE_FAIL2BAN=false
+            ENABLE_MAINTENANCE=false
+            ENABLE_DOCKER=false
+            [[ "$OLD_FAIL2BAN" == enabled ]] && ENABLE_FAIL2BAN=true
+            [[ "$OLD_MAINTENANCE" == enabled ]] && ENABLE_MAINTENANCE=true
+            [[ "$OLD_DOCKER" == enabled ]] && ENABLE_DOCKER=true
+            log_note "--yes: keeping recorded module set (fail2ban=${OLD_FAIL2BAN:-off}, maintenance=${OLD_MAINTENANCE:-off}, docker=${OLD_DOCKER:-off})"
+        fi
         return 0    # defaults: docker off, fail2ban on, maintenance on
     fi
+    # Re-run prefill (D3): recorded module states override the fresh
+    # defaults so an untouched OK is a true no-op on BOTH UI paths (S1/L2).
+    # "enabled" -> ON; anything else (disabled/skipped/failed/absent) -> OFF.
+    local recorded=false
+    if [[ -n "$OLD_FAIL2BAN" || -n "$OLD_MAINTENANCE" || -n "$OLD_DOCKER" ]]; then
+        recorded=true
+    fi
+    local fb=ON mnt=ON dn=OFF
+    if [[ "$recorded" == true ]]; then
+        fb=OFF; [[ "$OLD_FAIL2BAN" == enabled ]] && fb=ON
+        mnt=OFF; [[ "$OLD_MAINTENANCE" == enabled ]] && mnt=ON
+        dn=OFF;  [[ "$OLD_DOCKER" == enabled ]] && dn=ON
+    fi
+    local prefill_line="Pre-filled defaults: fail2ban=$fb, maintenance=$mnt, docker=$dn."
+    [[ "$recorded" == true ]] && \
+        prefill_line="Pre-filled from the last run: fail2ban=$fb, maintenance=$mnt, docker=$dn."
     if [[ "$USE_WHIPTAIL" == true ]]; then
         local out choices rc=0 yn=0 c
         while true; do
             out=$(ui_box --title "Modules" --checklist \
-                    "Choose what to install/configure (Space toggles):" 16 58 4 \
-                    "fail2ban"    "Intrusion prevention (systemd backend)" ON \
-                    "maintenance" "Weekly local apt maintenance cron"      ON \
-                    "docker"      "Docker Engine + Compose (hardened)"     OFF) || rc=$?
+                    "Choose what to install/configure (Space toggles).
+$prefill_line
+OK without changes KEEPS the current set." 16 58 5 \
+                    "fail2ban"    "Intrusion prevention (systemd backend)" "$fb" \
+                    "maintenance" "Weekly local apt maintenance cron"      "$mnt" \
+                    "docker"      "Docker Engine + Compose (hardened)"     "$dn") || rc=$?
             case $rc in
                 2) return 2 ;;    # Esc: quit, zero changes
                 1) return 1 ;;    # Cancel: back
@@ -1163,12 +1215,19 @@ prompt_modules() {
                 esac
             done
             # PITFALL GUARD (Guac/noVNC): whiptail checklist toggles (SPACE)
-            # can silently fail to register over remote consoles. If BOTH
-            # modules that DEFAULT ON come back unchecked with an empty
-            # selection (no manual toggle at all), re-confirm explicitly
-            # before proceeding — an empty OK here permanently disables
+            # can silently fail to register over remote consoles. If the
+            # checklist comes back with an EMPTY selection (no manual toggle
+            # registered at all) and BOTH default-ON modules are unchecked,
+            # re-confirm explicitly — an empty OK here permanently disables
             # fail2ban + maintenance while the operator believes they are on.
-            if [[ "$ENABLE_FAIL2BAN" != true && "$ENABLE_MAINTENANCE" != true ]]; then
+# State-aware trigger (D3): fires only when the prefill had
+            # fail2ban and/or maintenance ON (or there is no record at all).
+            # When a prior run already recorded both OFF, an untouched empty
+            # OK is the operator KEEPING that — re-asking would be a false
+            # positive.
+            if [[ -z "$out" && "$ENABLE_FAIL2BAN" != true && "$ENABLE_MAINTENANCE" != true ]] \
+               && { [[ "$recorded" != true ]] \
+                    || [[ "$OLD_FAIL2BAN" == enabled || "$OLD_MAINTENANCE" == enabled ]]; }; then
                 yn=0   # reset — `|| yn=$?` only assigns on nonzero (stale-rc guard)
                 ui_yesno "Module selection warning" \
                     "fail2ban and maintenance BOTH came back unchecked with an empty selection.
@@ -1187,28 +1246,60 @@ Proceed with both DISABLED?" "no" || yn=$?
         done
     fi
     # read fallback — explicit quit word on every yes/no (rc 2)
-    local yn1=0 yn2=0 yn3=0
-    ui_yesno "fail2ban" "Install fail2ban (intrusion prevention)?" "yes" || yn1=$?
+    local yn0=0 yn1=0 yn2=0 yn3=0
+    # KEEP-GATE (D3): when a prior run recorded the module set, one yes/no
+    # to keep it replaces the three sub-questions (default yes = keep) —
+    # the plain-read equivalent of the checklist's untouched-OK idiom (S1).
+    if [[ "$recorded" == true ]]; then
+        ui_yesno "Keep modules" \
+            "Keep the current modules (fail2ban=${OLD_FAIL2BAN:-disabled}, maintenance=${OLD_MAINTENANCE:-disabled}, docker=${OLD_DOCKER:-disabled})?" "yes" || yn0=$?
+        case $yn0 in
+            2) return 2 ;;
+            0)
+                ENABLE_FAIL2BAN=false
+                ENABLE_MAINTENANCE=false
+                ENABLE_DOCKER=false
+                [[ "$OLD_FAIL2BAN" == enabled ]] && ENABLE_FAIL2BAN=true
+                [[ "$OLD_MAINTENANCE" == enabled ]] && ENABLE_MAINTENANCE=true
+                [[ "$OLD_DOCKER" == enabled ]] && ENABLE_DOCKER=true
+                log_note "modules kept as recorded (fail2ban=$ENABLE_FAIL2BAN, maintenance=$ENABLE_MAINTENANCE, docker=$ENABLE_DOCKER)"
+                return 0
+                ;;
+            1) ;;    # No -> review/change the three modules below
+        esac
+    fi
+    # The sub-questions START from the recorded answer on re-runs (S1 §2.4
+    # parity with the checklist prefill) so changing one module can never
+    # silently flip the other two back to the first-run defaults.
+    local d1=yes d2=yes d3=no
+    if [[ -n "$OLD_FAIL2BAN" ]]; then      d1=no; [[ "$OLD_FAIL2BAN" == enabled ]] && d1=yes; fi
+    if [[ -n "$OLD_MAINTENANCE" ]]; then   d2=no; [[ "$OLD_MAINTENANCE" == enabled ]] && d2=yes; fi
+    if [[ -n "$OLD_DOCKER" ]]; then        d3=no; [[ "$OLD_DOCKER" == enabled ]] && d3=yes; fi
+    ui_yesno "fail2ban" "Install fail2ban (intrusion prevention)?" "$d1" || yn1=$?
     case $yn1 in
         2) return 2 ;;
         1) ENABLE_FAIL2BAN=false ;;
         0) ENABLE_FAIL2BAN=true ;;
     esac
-    ui_yesno "maintenance" "Enable weekly LOCAL maintenance (apt update/upgrade, conditional reboot)?" "yes" || yn2=$?
+    ui_yesno "maintenance" "Enable weekly LOCAL maintenance (apt update/upgrade, conditional reboot)?" "$d2" || yn2=$?
     case $yn2 in
         2) return 2 ;;
         1) ENABLE_MAINTENANCE=false ;;
         0) ENABLE_MAINTENANCE=true ;;
     esac
-    ui_yesno "docker" "Install Docker Engine + Compose (hardened daemon)?" "no" || yn3=$?
+    ui_yesno "docker" "Install Docker Engine + Compose (hardened daemon)?" "$d3" || yn3=$?
     case $yn3 in
         2) return 2 ;;
         1) ENABLE_DOCKER=false ;;
         0) ENABLE_DOCKER=true ;;
     esac
-    # same pitfall guard on the read fallback: both default-ON rejected
-    if [[ "$ENABLE_FAIL2BAN" != true && "$ENABLE_MAINTENANCE" != true ]]; then
-        ui_msg "NOTE: fail2ban and maintenance are both DISABLED — both default ON.
+    # same pitfall note on the read fallback, gated identically to the
+    # whiptail guard: only remind when the prefill had fail2ban and/or
+    # maintenance ON (or there is no prior record at all)
+    if [[ "$ENABLE_FAIL2BAN" != true && "$ENABLE_MAINTENANCE" != true ]] \
+       && { [[ "$recorded" != true ]] \
+            || [[ "$OLD_FAIL2BAN" == enabled || "$OLD_MAINTENANCE" == enabled ]]; }; then
+        ui_msg "NOTE: fail2ban and maintenance are both DISABLED (they default ON).
 You answered No to both; re-run with --fail2ban/--maintenance to flip."
     fi
     return 0
@@ -1222,15 +1313,16 @@ prompt_docker_user() {
         return 0
     fi
     if [[ "$ASSUME_YES" == true ]]; then
-        DOCKER_USER="$TARGET_USER"
+        DOCKER_USER="${OLD_DOCKER_USER:-$TARGET_USER}"
         return 0
     fi
+    local default="${OLD_DOCKER_USER:-$TARGET_USER}"
     local answer rc=0
     while true; do
         answer=$(ui_input "Docker user" \
             "User added to the 'docker' group (root-equivalent on this host).
-Default: the admin user ($TARGET_USER)." \
-            "$TARGET_USER") || rc=$?
+Leave as-is + OK to keep '$default' — nothing is changed." \
+            "$default") || rc=$?
         case $rc in
             2) return 2 ;;
             1) return 1 ;;
@@ -1260,7 +1352,8 @@ prompt_maint_time() {
     while true; do
         answer=$(ui_input "Maintenance time" \
             "Weekly maintenance runs every Sunday at this time (24h HH:MM).
-It is LOCAL and never downloads anything." \
+It is LOCAL and never downloads anything.
+Leave as-is + OK to keep $default — nothing is changed." \
             "$default") || rc=$?
         case $rc in
             2) return 2 ;;
@@ -1411,7 +1504,10 @@ prompt_firewall() {
             return 0
         else
             local text yn=0
-            text="A NON-UFW firewall stack is ACTIVE on this box: $FW_STACK.\n\nUFW would be layered ON TOP of it. Existing rules are never reset (M6), but two stacks can fight over the same chains.\n\nProceed with UFW anyway?"
+            text="A NON-UFW firewall stack is ACTIVE on this box: $FW_STACK.
+UFW would be layered ON TOP. Existing rules are never reset (M6), but two
+stacks can fight over the same chains.
+Proceed with UFW anyway? (No keeps $FW_STACK untouched.)"
             ui_yesno "Existing firewall detected" "$text" "no" || yn=$?
             case $yn in
                 2) return 2 ;;
@@ -1437,7 +1533,7 @@ prompt_firewall() {
             ui_msg "Existing UFW rules ($FW_RULES_SEEN) — crusty never resets or hides these:
 $rules"
             local yn=0
-            ui_yesno "Review existing rules" "Remove any pre-existing UFW rule as part of this run? (each removal is explicit and shown in the plan)" "no" || yn=$?
+            ui_yesno "Review existing rules" "Remove any pre-existing UFW rule as part of this run? (each removal is explicit and shown in the plan; No = keep all existing rules — default.)" "no" || yn=$?
             case $yn in
                 2) return 2 ;;
                 1) FW_REVIEWED=true ;;

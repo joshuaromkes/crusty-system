@@ -34,6 +34,34 @@ Preflight (OS + environment detection) → collect everything up front (≤9 pro
 
 Log: `/var/log/crusty-install.log`.
 
+## Skipping / idempotency contract
+
+Re-runs **converge**: an identical re-run applies zero changes. Every wizard
+prompt is skippable — "skip" means **don't touch that thing**, and a skipped
+field **never changes existing state**:
+
+- **Text boxes** (admin user, SSH port, docker user, maintenance time) are
+  pre-filled from `/etc/crusty.conf` on re-runs. Pressing OK without typing
+  keeps the shown value; leaving the box blank also keeps it (blank resolves
+  to the pre-filled default).
+- **Password (both boxes):** leaving BOTH fields empty and pressing OK skips.
+  An existing password is **never** touched; a new/locked account stays
+  locked and key-only. `chpasswd` is only ever invoked when you typed a real
+  password.
+- **Yes/no prompts** (sudo access, firewall) highlight your previous answer;
+  Enter keeps it.
+- **Menus** (SSH keys, rule removal) put a "keep / no change" or "done" item
+  first — picking it changes nothing.
+- **Modules checklist** starts from the recorded set (fail2ban=…,
+  maintenance=…, docker=…); OK without changes keeps it. On the plain-read
+  fallback, re-runs ask one "Keep the current modules (…)? [Y/n]" question
+  instead of all three.
+
+Every dialog shows a one-line hint stating this ("Leave as-is + OK to keep …
+— nothing is changed."). `Esc`/Back never skip a field: **`Esc` quits the
+whole wizard with zero changes**, `Back` goes one step back, and the final
+confirmation cannot be skipped (only `--yes` bypasses it).
+
 ## Flags
 
 A flag pre-fills its answer and skips its prompt. `--yes` takes defaults for the rest. **Headless runs (no TTY — `curl | bash`, CI) require `--user` and `--yes`;** `--ssh-key` is required too unless the state file already records a valid key for the user (re-run convenience: a module-flip re-run never re-declares a key). The account stays password-locked (key-only) by design in headless mode — there is no `--password` flag because argv leaks through `ps` and shell history.
