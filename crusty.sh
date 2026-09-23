@@ -340,7 +340,10 @@ resolve_key_input() {
 collect_existing_keys() {
     EXISTING_KEYS=()
     local user="$1" home="" file
-    home="$(getent passwd "$user" 2>/dev/null | cut -d: -f6)"
+    # `|| true`: under set -Eeuo pipefail a failing getent (user not created
+    # YET during the wizard — prompt_ssh_key runs before the apply phase)
+    # would otherwise abort the whole script on a fresh box.
+    home="$(getent passwd "$user" 2>/dev/null | cut -d: -f6 || true)"
     [[ -z "$home" || ! -d "$home" ]] && return 0
     file="$home/.ssh/authorized_keys"
     [[ -f "$file" ]] || return 0
@@ -975,7 +978,7 @@ view_keys() {
         k="${EXISTING_KEYS[$i]}"
         fp=""
         if command -v ssh-keygen &>/dev/null; then
-            fp="$(printf '%s\n' "$k" | ssh-keygen -lf - 2>/dev/null | awk '{print $2}')"
+            fp="$(printf '%s\n' "$k" | ssh-keygen -lf - 2>/dev/null | awk '{print $2}' || true)"
         fi
         out+="\n[$((i + 1))] ${fp:-${k:0:60}}"
     done
@@ -1111,10 +1114,10 @@ prompt_port() {
             continue
         fi
         if (( 10#$answer < 1024 )) && [[ "$answer" != 22 ]]; then
+            yn=0   # reset — `|| yn=$?` only assigns on nonzero (stale-rc guard)
             ui_yesno "SSH port < 1024" \
                 "Ports below 1024 are usually reserved for system services.
-Use port $answer anyway?" "no"
-            yn=$?
+Use port $answer anyway?" "no" || yn=$?
             case $yn in
                 2) return 2 ;;
                 1) continue ;;
@@ -1166,14 +1169,14 @@ prompt_modules() {
             # before proceeding — an empty OK here permanently disables
             # fail2ban + maintenance while the operator believes they are on.
             if [[ "$ENABLE_FAIL2BAN" != true && "$ENABLE_MAINTENANCE" != true ]]; then
+                yn=0   # reset — `|| yn=$?` only assigns on nonzero (stale-rc guard)
                 ui_yesno "Module selection warning" \
                     "fail2ban and maintenance BOTH came back unchecked with an empty selection.
 
 If you intended them ON and only pressed Enter, the checklist SPACE-toggles
 may not have registered over this console (known Guac/noVNC issue).
 
-Proceed with both DISABLED?" "no"
-                yn=$?
+Proceed with both DISABLED?" "no" || yn=$?
                 case $yn in
                     2) return 2 ;;
                     1) continue ;;    # re-show the checklist
@@ -1185,22 +1188,19 @@ Proceed with both DISABLED?" "no"
     fi
     # read fallback — explicit quit word on every yes/no (rc 2)
     local yn1=0 yn2=0 yn3=0
-    ui_yesno "fail2ban" "Install fail2ban (intrusion prevention)?" "yes"
-    yn1=$?
+    ui_yesno "fail2ban" "Install fail2ban (intrusion prevention)?" "yes" || yn1=$?
     case $yn1 in
         2) return 2 ;;
         1) ENABLE_FAIL2BAN=false ;;
         0) ENABLE_FAIL2BAN=true ;;
     esac
-    ui_yesno "maintenance" "Enable weekly LOCAL maintenance (apt update/upgrade, conditional reboot)?" "yes"
-    yn2=$?
+    ui_yesno "maintenance" "Enable weekly LOCAL maintenance (apt update/upgrade, conditional reboot)?" "yes" || yn2=$?
     case $yn2 in
         2) return 2 ;;
         1) ENABLE_MAINTENANCE=false ;;
         0) ENABLE_MAINTENANCE=true ;;
     esac
-    ui_yesno "docker" "Install Docker Engine + Compose (hardened daemon)?" "no"
-    yn3=$?
+    ui_yesno "docker" "Install Docker Engine + Compose (hardened daemon)?" "no" || yn3=$?
     case $yn3 in
         2) return 2 ;;
         1) ENABLE_DOCKER=false ;;
@@ -1331,7 +1331,7 @@ fw_detect_stack() {
 fw_rule_specs() {
     command -v ufw >/dev/null 2>&1 || return 0
     local spec q
-    ufw show added 2>/dev/null | awk '$2 == "ALLOW" || $2 == "DENY" || $2 == "LIMIT" {
+    { ufw show added 2>/dev/null || true; } | awk '$2 == "ALLOW" || $2 == "DENY" || $2 == "LIMIT" {
         printf "%s %s\n", tolower($2), $1 }' | sort -u | while IFS= read -r spec; do
         for q in "${FW_REMOVE_RULES[@]:-}"; do
             [[ "$spec" == "$q" ]] && continue 2
@@ -1410,10 +1410,10 @@ prompt_firewall() {
             UFW_SKIPPED=true
             return 0
         else
-            local text
+            local text yn=0
             text="A NON-UFW firewall stack is ACTIVE on this box: $FW_STACK.\n\nUFW would be layered ON TOP of it. Existing rules are never reset (M6), but two stacks can fight over the same chains.\n\nProceed with UFW anyway?"
-            ui_yesno "Existing firewall detected" "$text" "no"
-            case $? in
+            ui_yesno "Existing firewall detected" "$text" "no" || yn=$?
+            case $yn in
                 2) return 2 ;;
                 1) log_note "UFW skipped — keeping the existing $FW_STACK stack"
                    UFW_SKIPPED=true
@@ -1436,8 +1436,8 @@ prompt_firewall() {
             rules="$(fw_rule_specs)"
             ui_msg "Existing UFW rules ($FW_RULES_SEEN) — crusty never resets or hides these:
 $rules"
-            ui_yesno "Review existing rules" "Remove any pre-existing UFW rule as part of this run? (each removal is explicit and shown in the plan)" "no"
-            local yn=$?
+            local yn=0
+            ui_yesno "Review existing rules" "Remove any pre-existing UFW rule as part of this run? (each removal is explicit and shown in the plan)" "no" || yn=$?
             case $yn in
                 2) return 2 ;;
                 1) FW_REVIEWED=true ;;
@@ -1491,12 +1491,11 @@ $rules"
         for entry in "${cutoff[@]}"; do
             list+="  ${entry%%/*}  (${entry#*/})\n"
         done
-        local warn_text
+        local warn_text yn2=0
         warn_text="Default-deny incoming would cut off these services:
 $list
 Allow them through UFW now? (one-shot; removed rules stay removed)"
-        ui_yesno "Services affected by default-deny" "$warn_text" "yes"
-        local yn2=$?
+        ui_yesno "Services affected by default-deny" "$warn_text" "yes" || yn2=$?
         case $yn2 in
             2) return 2 ;;
             1) log_note "listeners NOT auto-allowed — they will be cut off by default-deny" ;;
@@ -2149,7 +2148,9 @@ EOF
     # I3: hash-compare against the active config — skip everything when
     # content is identical, so a re-run does ZERO writes.
     local old_hash new_hash
-    old_hash=$(md5sum /etc/ssh/sshd_config 2>/dev/null | cut -d' ' -f1)
+    # `|| true`: missing live config (stripped image) = empty hash -> need_write,
+    # not an errexit abort.
+    old_hash=$(md5sum /etc/ssh/sshd_config 2>/dev/null | cut -d' ' -f1 || true)
     new_hash=$(md5sum "$candidate" | cut -d' ' -f1)
     local need_write=false
     [[ "$old_hash" != "$new_hash" ]] && need_write=true
@@ -2826,7 +2827,7 @@ do_uninstall() {
     # there before crusty and are left alone.
     if command -v ufw &>/dev/null && ufw status 2>/dev/null | grep -q "Status: active"; then
         local crusty_ports p
-        crusty_ports=$(ufw status 2>/dev/null | grep -F "crusty-ssh" | awk '{print $1}' | sed 's|/tcp$||' | sort -u)
+        crusty_ports=$(ufw status 2>/dev/null | grep -F "crusty-ssh" | awk '{print $1}' | sed 's|/tcp$||' | sort -u || true)
         for p in $crusty_ports; do
             if ufw delete allow "$p/tcp" >/dev/null 2>&1; then
                 log "removed crusty-added UFW rule for $p/tcp"

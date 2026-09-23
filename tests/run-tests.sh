@@ -796,6 +796,206 @@ else
 fi
 
 # ----------------------------------------------------------------------------
+section "8. set -e landmine regression (real wizard + real prompts)"
+# The landmine class: a BARE `ui_yesno; rc=$?` (missing `||`) aborts the whole
+# script under `set -Eeuo pipefail` on ANY nonzero dialog answer (No=1,
+# Esc=2, Back=1). Section 2 tested the loop with ALL steps stubbed; here the
+# REAL prompt_sudo / prompt_port run inside the REAL wizard with errexit
+# LIVE in wizard()'s own scope (main calls wizard() bare — no masking at
+# that level), proving the user answers the bug used to kill are handled:
+#   (a) No  at sudo -> wizard CONTINUES and completes
+#   (b) Esc at sudo -> wizard quits cleanly, exit 0, "nothing was changed"
+#   (c) Back mid-wizard -> steps back one, then completes (stale-rc proof)
+#   (d) dry-run re-run -> converges: exit 0, identical output, zero writes
+# NOTE: the harness itself runs `set -uo pipefail` (no -e), so EACH case
+# enables errexit explicitly inside its own subshell.
+
+# 8a. NO at sudo must CONTINUE the wizard to the end (real prompt_sudo)
+SUDO_NO=$(
+    set -Eeuo pipefail
+    trap 'echo "  [ERR] line $LINENO: $BASH_COMMAND" >&2' ERR
+    stub_log
+    crusty_globals
+    sudo_default() { printf no; }
+    ui_yesno() { return 1; }        # operator answers NO at sudo
+    ui_msg()   { :; }
+    ui_input()  { printf '22'; return 0; }
+    ui_password() { return 0; }
+    prompt_user()  { return 0; }
+    prompt_password() { return 0; }
+    prompt_ssh_key()  { USER_PUBLIC_KEY="ssh-ed25519 AAAATEST dry@t"; return 0; }
+    prompt_port()     { return 0; }
+    prompt_modules()  { return 0; }
+    prompt_firewall() { return 0; }
+    prompt_docker_user() { return 0; }
+    prompt_maint_time()  { return 0; }
+    source <("$EXTRACT" wizard)
+    source <("$EXTRACT" prompt_sudo)
+    wizard
+    echo "GRANT_SUDO=$GRANT_SUDO COMPLETED=1"
+)
+if [[ "$SUDO_NO" == *"GRANT_SUDO=no COMPLETED=1"* ]]; then
+    ok
+else
+    fail "No at sudo must continue the wizard and complete (got: $SUDO_NO)"
+fi
+
+# 8a-esc. ESC at sudo must QUIT cleanly (exit 0) with 'nothing was changed'
+SUDO_ESC=$(
+    set -Eeuo pipefail
+    trap 'echo "  [ERR] line $LINENO: $BASH_COMMAND" >&2' ERR
+    stub_log
+    crusty_globals
+    sudo_default() { printf no; }
+    ui_yesno() { return 2; }        # Esc / quit at sudo
+    ui_msg()   { :; }
+    ui_input()  { printf '22'; return 0; }
+    ui_password() { return 0; }
+    log_note() { printf 'NOTE: %s\n' "$*"; }   # surface the quit message
+    prompt_user()  { return 0; }
+    prompt_password() { return 0; }
+    prompt_ssh_key()  { USER_PUBLIC_KEY="ssh-ed25519 AAAATEST dry@t"; return 0; }
+    prompt_port()     { return 0; }
+    prompt_modules()  { return 0; }
+    prompt_firewall() { return 0; }
+    prompt_docker_user() { return 0; }
+    prompt_maint_time()  { return 0; }
+    source <("$EXTRACT" wizard)
+    source <("$EXTRACT" prompt_sudo)
+    wizard
+)
+SUDO_ESC_RC=$?
+if [[ $SUDO_ESC_RC -eq 0 && "$SUDO_ESC" == *"nothing was changed"* ]]; then
+    ok
+else
+    fail "Esc at sudo must exit 0 with 'nothing was changed' (rc=$SUDO_ESC_RC out=$SUDO_ESC)"
+fi
+
+# 8b. BACK at a mid-wizard prompt (REAL wizard + REAL prompt_port): the first
+#     ui_input answers Back (rc 1), so the wizard steps back one — prompt_ssh_key
+#     runs again (key_calls=2) — then the port prompt completes and the wizard
+#     finishes. Also proves the c59bbee rc=0-per-iteration reset: with a stale
+#     rc persisting after a Back, the next successful step would be misread as
+#     Back and cascade to a silent cancel (key_calls would stay 1 or abort).
+#     NOTE: the answer stack lives in a FILE because ui_input is called from
+#     `answer=$(ui_input ...)` — a nested $() subshell, so a shell-variable
+#     counter would reset on every call.
+BACK_STEP=$(
+    set -Eeuo pipefail
+    trap 'echo "  [ERR] line $LINENO: $BASH_COMMAND" >&2' ERR
+    stub_log
+    crusty_globals
+    key_calls=0
+    ANSQ="$TMP/ans.8b"; printf 'BACK\n22\n22\n22\n' > "$ANSQ"
+    ui_input() { local first
+        first=$(head -n 1 "$ANSQ" 2>/dev/null); sed -i '1d' "$ANSQ" 2>/dev/null || true
+        if [[ "$first" == BACK ]]; then return 1; fi
+        printf '%s' "${first:-22}"; return 0; }
+    validate_port() { [[ "$1" == 22 ]]; }
+    prompt_user()         { return 0; }
+    prompt_password()     { return 0; }
+    prompt_sudo()         { return 0; }
+    prompt_ssh_key()      { key_calls=$((key_calls + 1)); return 0; }
+    prompt_modules()      { return 0; }
+    prompt_firewall()     { return 0; }
+    prompt_docker_user()  { return 0; }
+    prompt_maint_time()   { return 0; }
+    source <("$EXTRACT" wizard)
+    source <("$EXTRACT" prompt_port)
+    wizard
+    echo "key_calls=$key_calls"
+)
+if [[ "$BACK_STEP" == *"key_calls=2"* ]]; then
+    ok
+else
+    fail "Back at mid-wizard must re-run the previous step once (got: $BACK_STEP)"
+fi
+
+# 8b-direct. prompt_port as a DIRECT call under a LIVE-errexit caller (the
+# context that would abort on the old bare internal `ui_yesno; yn=$?`):
+# Back propagates rc 1, then a low-port + held-NO loop, then a plain port
+# completes with rc 0 — no silent abort at any step.
+PORT_DIRECT=$(
+    set -Eeuo pipefail
+    trap 'echo "  [ERR] line $LINENO: $BASH_COMMAND" >&2' ERR
+    stub_log
+    crusty_globals
+    ANSQ="$TMP/ans.8bd"; printf 'BACK\n222\n22\n' > "$ANSQ"
+    ui_input() { local first
+        first=$(head -n 1 "$ANSQ" 2>/dev/null); sed -i '1d' "$ANSQ" 2>/dev/null || true
+        if [[ "$first" == BACK ]]; then return 1; fi
+        printf '%s' "${first:-22}"; return 0; }
+    ui_yesno() { return 1; }                # decline the low port
+    validate_port() { [[ "$1" =~ ^[0-9]+$ && "$1" -ge 1 && "$1" -le 65535 ]]; }
+    source <("$EXTRACT" prompt_port)
+    rc1=0 rc2=0    # pre-init: `|| rc=$?` only assigns on NONZERO return
+    prompt_port || rc1=$?
+    prompt_port || rc2=$?
+    echo "rc1=$rc1 rc2=$rc2"
+)
+if [[ "$PORT_DIRECT" == *"rc1=1 rc2=0"* ]]; then
+    ok
+else
+    fail "direct prompt_port Back=rc1 then ok=rc0 (got: $PORT_DIRECT)"
+fi
+
+# 8c. dry-run re-run converges: two consecutive headless dry-runs with the
+#     same answers must both exit 0, produce IDENTICAL output, and write
+#     nothing (no state file created). A completed wizard must not crash or
+#     go non-deterministic on the second pass.
+if command -v ssh-keygen >/dev/null; then
+    ssh-keygen -t ed25519 -N '' -C 'dry@crusty' -f "$TMP/dry_key" -q >/dev/null 2>&1
+    DRY_SSH_KEY="$(cat "$TMP/dry_key.pub" 2>/dev/null)"
+else
+    DRY_SSH_KEY=""
+fi
+if [[ -n "$DRY_SSH_KEY" ]]; then
+    mkdir -p "$TMP/dry/etc" "$TMP/dry/var"
+    dry_run() {
+        if [[ $EUID -eq 0 ]]; then
+            env CRUSTY_STATE_FILE="$TMP/dry/etc/crusty.conf" \
+                CRUSTY_INSTALL_LOG="$TMP/dry/var/install.log" \
+                CRUSTY_CRON_FILE="$TMP/dry/etc/cron" \
+                CRUSTY_JAIL_LOCAL="$TMP/dry/etc/jail.local" \
+                CRUSTY_DAEMON_JSON="$TMP/dry/etc/daemon.json" \
+                CRUSTY_BACKUP_ROOT="$TMP/dry/etc/backups-" \
+                bash crusty.sh --dry-run --yes --user crustytest --ssh-key "$DRY_SSH_KEY" 2>&1
+        elif sudo -n true 2>/dev/null; then
+            # root re-exec via passwordless sudo: pass the sandbox overrides
+            # through the sudo command line (env_reset would drop plain env)
+            sudo -n CRUSTY_STATE_FILE="$TMP/dry/etc/crusty.conf" \
+                CRUSTY_INSTALL_LOG="$TMP/dry/var/install.log" \
+                CRUSTY_CRON_FILE="$TMP/dry/etc/cron" \
+                CRUSTY_JAIL_LOCAL="$TMP/dry/etc/jail.local" \
+                CRUSTY_DAEMON_JSON="$TMP/dry/etc/daemon.json" \
+                CRUSTY_BACKUP_ROOT="$TMP/dry/etc/backups-" \
+                bash crusty.sh --dry-run --yes --user crustytest --ssh-key "$DRY_SSH_KEY" 2>&1
+        else
+            # no sudo: ensure_root's dry-run branch warns and continues as-is
+            env CRUSTY_STATE_FILE="$TMP/dry/etc/crusty.conf" \
+                CRUSTY_INSTALL_LOG="$TMP/dry/var/install.log" \
+                CRUSTY_CRON_FILE="$TMP/dry/etc/cron" \
+                CRUSTY_JAIL_LOCAL="$TMP/dry/etc/jail.local" \
+                CRUSTY_DAEMON_JSON="$TMP/dry/etc/daemon.json" \
+                CRUSTY_BACKUP_ROOT="$TMP/dry/etc/backups-" \
+                bash crusty.sh --dry-run --yes --user crustytest --ssh-key "$DRY_SSH_KEY" 2>&1
+        fi
+    }
+    DRY_OUT1="$(dry_run)"; DRY_RC1=$?
+    DRY_OUT2="$(dry_run)"; DRY_RC2=$?
+    if [[ $DRY_RC1 -eq 0 && $DRY_RC2 -eq 0 \
+          && "$DRY_OUT1" == "$DRY_OUT2" \
+          && ! -f "$TMP/dry/etc/crusty.conf" ]]; then
+        ok
+    else
+        echo "  (dry run1 rc=$DRY_RC1 run2 rc=$DRY_RC2, state file: $([ -f "$TMP/dry/etc/crusty.conf" ] && echo CREATED || echo absent))"
+        fail "dry-run re-run must converge: both exit 0, identical output, zero writes"
+    fi
+else
+    echo "  (ssh-keygen unavailable — dry-run re-run test skipped)"
+fi
+
+# ----------------------------------------------------------------------------
 echo
 echo "=========================================================="
 echo "PASS: $PASS   FAIL: $FAIL"
