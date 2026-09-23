@@ -811,8 +811,7 @@ wizard() {
     )
     local i=0 rc=0
     while (( i < ${#steps[@]} )); do
-        "${steps[$i]}"
-        rc=$?
+        "${steps[$i]}" || rc=$?
         case $rc in
             0)   i=$((i + 1)) ;;
             2)   log_note "quit requested — nothing was changed"
@@ -920,8 +919,7 @@ prompt_sudo() {
     text="Add '$TARGET_USER' to the 'sudo' group?
 (LXC default: no — the PVE console is the admin path.
 VM/bare-metal default: yes.)"
-    ui_yesno "Sudo access" "$text" "$def"
-    rc=$?
+    ui_yesno "Sudo access" "$text" "$def" || rc=$?
     case $rc in
         2) return 2 ;;
         0) GRANT_SUDO="yes" ;;
@@ -1616,8 +1614,7 @@ confirm_plan() {
     ui_yesno "Confirm" "Apply this plan now?
 A FINAL WARNING: this restarts sshd (existing sessions survive) and
 disables password authentication. Keep this session open until you have
-tested the new connection." "no"
-    rc=$?
+tested the new connection." "no" || rc=$?
     case $rc in
         2) log_note "quit requested at the final confirmation — nothing was changed"; exit 0 ;;
         1) die "cancelled at the final confirmation — nothing was changed" ;;
