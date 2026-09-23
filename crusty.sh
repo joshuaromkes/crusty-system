@@ -56,13 +56,14 @@ set -Eeuo pipefail
 # Constants
 # ─────────────────────────────────────────────────────────────
 
-CRUSTY_VERSION="2.0.0"
-STATE_FILE="/etc/crusty.conf"
-INSTALL_LOG="/var/log/crusty-install.log"
-CRON_FILE="/etc/cron.d/crusty-maintenance"
-JAIL_LOCAL="/etc/fail2ban/jail.local"
-DAEMON_JSON="/etc/docker/daemon.json"
-BACKUP_ROOT="/root/crusty-backups-"
+CRUSTY_VERSION="2.0.1"
+# Env-overridable for tests (a fake-root harness redirects these to a sandbox)
+STATE_FILE="${CRUSTY_STATE_FILE:-/etc/crusty.conf}"
+INSTALL_LOG="${CRUSTY_INSTALL_LOG:-/var/log/crusty-install.log}"
+CRON_FILE="${CRUSTY_CRON_FILE:-/etc/cron.d/crusty-maintenance}"
+JAIL_LOCAL="${CRUSTY_JAIL_LOCAL:-/etc/fail2ban/jail.local}"
+DAEMON_JSON="${CRUSTY_DAEMON_JSON:-/etc/docker/daemon.json}"
+BACKUP_ROOT="${CRUSTY_BACKUP_ROOT:-/root/crusty-backups-}"
 
 # LXC consoles can report 0x0 winsize — keep whiptail happy
 export LINES="${LINES:-24}"
@@ -76,6 +77,10 @@ CRUSTY_USER_UID=""
 SET_PASSWORD=""
 GRANT_SUDO=""
 USER_PUBLIC_KEY=""
+KEEP_KEYS=false          # re-run bypass: leave installed keys exactly as-is
+REMOVE_KEYS=()           # keys explicitly queued for removal (shown in the plan)
+EXISTING_KEYS=()         # keys already installed for the target user (pre-run)
+SSH_KEY_FP=""            # fingerprint of the key this run installed/keeps (state)
 SSH_PORT=22
 ALLOW_TCP_FORWARDING="no"
 ENABLE_DOCKER=false
@@ -93,6 +98,8 @@ UNINSTALL=false
 # UI capability
 HAVE_TTY=false
 USE_WHIPTAIL=false
+UI_CHILD=""                # pid of the live whiptail dialog (signal-aware kill)
+KEY_MAX_LEN=4096           # pastes above this are rejected (paste/UI wedge guard)
 
 # Environment
 ENV_CLASS="bare"
@@ -111,6 +118,15 @@ PRIMARY_IP=""
 CURRENT_SSH_PORTS=(22)
 # Old ports we temporarily allowed in UFW during a port transition
 UFW_TEMP_PORTS=()
+# Firewall pre-flight (round-4, item 6): detected stack + operator decisions.
+# FW_STACK is one of: none|ufw|inactive-ufw|firewalld|nft|iptables.
+FW_STACK="none"
+FW_REVIEWED=false            # existing rules were shown to the operator
+FW_ALLOW_EXTRA=()            # inbound listeners the operator chose to keep open
+FW_RULES_SEEN=0              # count of pre-existing rules shown in the plan
+FW_OPERATOR_ACK=false        # non-UFW stack layering explicitly acknowledged
+FW_OPT_OUT=false             # flag-forced: never layering UFW (--no-firewall)
+FW_OPT_IN=false              # flag-forced: revisit/force UFW layering (--firewall)
 # Old state (for pre-fill / drift view)
 OLD_TARGET_USER=""
 OLD_SSH_PORT=""
@@ -118,7 +134,12 @@ OLD_MAINT_TIME=""
 OLD_CREATED_USER=""
 OLD_USER_UID=""
 OLD_SUDO_ADDED=""
+OLD_SUDO=""              # previous SUDO choice — re-run pre-fill / convergence
+OLD_SSH_KEY_FP=""        # fingerprint of a key crusty installed (headless bypass)
 OLD_DGROUP_ADDED=""
+OLD_FW_STACK=""          # firewall stack detected at the previous run
+OLD_FW_EXTRA_ALLOW=""    # listeners allowed in a previous run (re-run pre-fill)
+OLD_FW_ACK=""            # previous run's layering acknowledgment (yes/no)
 
 # ─────────────────────────────────────────────────────────────
 # Logging + traps
@@ -178,17 +199,28 @@ on_exit() {
     fi
 }
 
-on_signal() {
-    # Log only. The trap line that calls this supplies the correct exit
-    # code (128+signum); exiting here would mask it (256 wraps to 0).
-    log_warn "caught SIG$1 — exiting without further changes"
+sig_handler() {
+    # Esc (whiptail rc 255) is the in-dialog quit; for real signals this is
+    # the fallback when a dialog is up: whiptail/newt IGNORES INT and TERM
+    # while it owns the raw terminal (verified empirically — even
+    # group-level SIGTERM leaves the dialog up), so the live dialog child
+    # is killed here. The invoking shell restores the terminal on exit.
+    local sig="$1" code="$2"
+    if [[ -n "$UI_CHILD" ]]; then
+        kill -TERM "$UI_CHILD" 2>/dev/null || true
+        kill -KILL "$UI_CHILD" 2>/dev/null || true
+        wait "$UI_CHILD" 2>/dev/null || true
+        UI_CHILD=""
+    fi
+    log_warn "caught SIG$sig — exiting without further changes"
+    exit "$code"
 }
 
 trap on_error ERR
 trap on_exit EXIT
-trap 'on_signal INT; exit 130' INT
-trap 'on_signal TERM; exit 143' TERM
-trap 'on_signal HUP; exit 129' HUP
+trap 'sig_handler INT 130' INT
+trap 'sig_handler TERM 143' TERM
+trap 'sig_handler HUP 129' HUP
 
 # ─────────────────────────────────────────────────────────────
 # Usage
@@ -209,7 +241,11 @@ Options:
   --user NAME              admin user the SSH key is installed for (refuses
                            root; created if absent, reused if present)
   --ssh-key KEY            SSH public key (paste or path to a .pub file);
-                           validated before use
+                           validated before use. Optional on re-runs when
+                           the state file records a valid key for the user
+  --sudo / --no-sudo       add the admin user to the 'sudo' group
+                           (interactive default: no in LXC, yes on VM/bare;
+                           re-runs pre-fill the previous choice)
   --port N                 SSH port, default 22 (warns below 1024)
   --docker / --no-docker   install Docker Engine module (default: no)
   --docker-user NAME       user added to the docker group
@@ -220,6 +256,10 @@ Options:
   --time HH:MM             maintenance time, default 02:00 Sunday
   --tcp-forwarding no|local|yes    AllowTcpForwarding, default no
                            (flag only — there is no wizard prompt for it)
+  --firewall / --no-firewall   UFW on top of any detected firewall stack
+                           (default: interactive asks when a non-UFW stack is
+                           active; --no-firewall skips UFW outright, --firewall
+                           forces layering even after a previous skip)
   --dry-run                show the plan, make zero changes
   --yes                    skip the final confirmation, take defaults
   --uninstall              remove exactly what crusty owns (incl. V1
@@ -230,9 +270,10 @@ What it configures:
   1. packages       openssh-server, ufw, fail2ban, cron (as chosen)
   2. admin user     created only if absent (getent-guarded); password via
                     prompt only (chpasswd stdin, never argv, never logged;
-                    decline = locked, key-only); sudo optional
+                    decline = locked, key-only); sudo optional (--sudo)
   3. SSH key        for the non-root admin user, verified before any
-                    restriction (C1)
+                    restriction (C1); re-runs can keep installed keys
+                    as-is, add another, or explicitly remove one
   4. sshd           hardened config: port, passwords off, root off,
                     pre-flight + atomic swap + rollback (C2)
   5. UFW            new port allowed, existing rules preserved (M6), old
@@ -292,6 +333,45 @@ resolve_key_input() {
     else
         printf '%s' "$input" | tr -d '\r\n'
     fi
+}
+
+# Load the keys currently installed for a user (before this run) into
+# EXISTING_KEYS (array of full key lines; comments/blank lines skipped).
+collect_existing_keys() {
+    EXISTING_KEYS=()
+    local user="$1" home="" file
+    home="$(getent passwd "$user" 2>/dev/null | cut -d: -f6)"
+    [[ -z "$home" || ! -d "$home" ]] && return 0
+    file="$home/.ssh/authorized_keys"
+    [[ -f "$file" ]] || return 0
+    local line
+    while IFS= read -r line; do
+        [[ "$line" == \#* || -z "$line" ]] && continue
+        EXISTING_KEYS+=("$line")
+    done < "$file"
+}
+
+# Has this user at least one installed key that passes validation (H10)?
+# Used by the headless --ssh-key bypass: never trust state alone — the key
+# must still actually be on disk.
+user_has_installed_key() {
+    local user="$1" k
+    collect_existing_keys "$user"
+    for k in "${EXISTING_KEYS[@]}"; do
+        if validate_public_key "$k" 2>/dev/null; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+# First-line key prompt length cap. Real ed25519 keys are ~100-750 chars;
+# a paste far beyond that is a wedged terminal or a foreign blob. We reject
+# instead of feeding a truncated fragment to the H10 validator (which would
+# then blame the KEY for what was a UI problem).
+key_overlong() {
+    local key="$1"
+    [[ ${#key} -gt $KEY_MAX_LEN ]]
 }
 
 validate_username() {
@@ -354,6 +434,14 @@ parse_args() {
                 ENABLE_MAINTENANCE=true; shift ;;
             --no-maintenance)
                 ENABLE_MAINTENANCE=false; shift ;;
+            --sudo)
+                GRANT_SUDO=yes; shift ;;
+            --no-sudo)
+                GRANT_SUDO=no; shift ;;
+            --firewall)
+                FW_OPT_OUT=false; FW_OPT_IN=true; shift ;;
+            --no-firewall)
+                FW_OPT_OUT=true; FW_OPT_IN=false; shift ;;
             --time)
                 need_value "$@"
                 if ! validate_time "$2"; then
@@ -412,50 +500,89 @@ ui_init() {
         USE_WHIPTAIL=true
     fi
     if [[ "$HAVE_TTY" != true ]]; then
-        # Spec §5: headless (no TTY — CI, cron) requires --user, --ssh-key
-        # and --yes; the account stays password-locked (key-only) by design.
+        # Spec §5: headless (no TTY — CI, cron) requires --user and --yes;
+        # the account stays password-locked (key-only) by design. --ssh-key
+        # is required later UNLESS the state file already records a valid
+        # key for the user (re-run bypass — checked in prompt_ssh_key).
         if [[ "$ASSUME_YES" != true ]]; then
-            die "No console (headless). Headless runs require --user, --ssh-key and --yes; the account stays password-locked (key-only) by design."
+            die "No console (headless). Headless runs require --user, --ssh-key (unless the state file already records a valid key for the user) and --yes; the account stays password-locked (key-only) by design."
         fi
         if [[ "$UNINSTALL" != true ]]; then
             [[ -n "$TARGET_USER" ]] || die "headless run requires --user NAME (there is no console to ask)"
-            [[ -n "$USER_PUBLIC_KEY" ]] || die "headless run requires --ssh-key KEY (a key is mandatory: password auth is disabled)"
         fi
     fi
 }
 
-# ui_input TITLE TEXT DEFAULT -> echoes the answer. rc 0 = ok, rc 1 = back.
-ui_input() {
-    local title="$1" text="$2" default="$3" out rc
-    if [[ "$USE_WHIPTAIL" == true ]]; then
-        if out=$(whiptail --title "$title" --inputbox "$text" 12 58 "$default" \
-                     --ok-button "OK" --cancel-button "Back" 3>&1 1>&2 2>&3); then
-            printf '%s' "$out"
-            return 0
-        fi
+# Run whiptail in the BACKGROUND and wait for it. A foreground child makes
+# bash defer the INT/TERM traps until the child exits, and whiptail/newt
+# ignores INT+TERM while the dialog owns the (raw) terminal — the old code
+# therefore wedged on ^C (byte in raw mode) and even on external signals.
+# As a background job the shell is free to run sig_handler and kill the
+# dialog child. rc passes through (0 ok, 1 Cancel, 255 Esc).
+ui_box() {
+    local rc=0 child
+    whiptail "$@" 3>&1 1>&2 2>&3 &
+    child=$!
+    UI_CHILD=$child
+    if ! wait "$child"; then
         rc=$?
-        return 1
     fi
-    printf '%s\n[%s]: ' "$text" "$default" > /dev/tty
+    UI_CHILD=""
+    return "$rc"
+}
+
+# Wide input box for SSH keys (real keys are ~100-750 chars; a narrow box
+# invites truncated pastes). Clamped to the terminal so whiptail never
+# errors out on a narrow LXC console.
+ui_key_width() {
+    local w=110
+    if [[ -n "${COLUMNS:-}" && "$COLUMNS" -gt 0 && "$COLUMNS" -lt 110 ]]; then
+        w="$COLUMNS"
+    fi
+    printf '%s' "$w"
+}
+
+# ui_input TITLE TEXT DEFAULT [WIDTH] -> echoes the answer. rc 0 = ok,
+# rc 1 = back (Cancel), rc 2 = quit (Esc / 'quit' in the read fallback).
+ui_input() {
+    local title="$1" text="$2" default="$3" width="${4:-58}" out rc=0
+    if [[ "$USE_WHIPTAIL" == true ]]; then
+        out=$(ui_box --title "$title" --inputbox "$text" 12 "$width" "$default" \
+                     --ok-button "OK" --cancel-button "Back") || rc=$?
+        if (( rc == 255 )); then
+            return 2   # Esc: quit the wizard, zero changes
+        fi
+        (( rc != 0 )) && return 1
+        printf '%s' "$out"
+        return 0
+    fi
+    printf '%s\n[%s] (enter ok, "quit" cancels): ' "$text" "$default" > /dev/tty
     if ! IFS= read -r out < /dev/tty; then
         die "console input closed (EOF) — aborting"
     fi
+    case "$out" in
+        [Qq][Uu][Ii][Tt]|[Cc][Aa][Nn][Cc][Ee][Ll]) return 2 ;;
+    esac
     printf '%s' "${out:-$default}"
     return 0
 }
 
-# ui_password TITLE TEXT -> echoes the password (possibly empty). rc 1 = back.
+# ui_password TITLE TEXT -> echoes the password (possibly empty). rc 1 = back,
+# rc 2 = quit. The plain-read fallback has no quit word on purpose (a password
+# may legitimately be 'quit') — Ctrl+C (cooked mode) is the quit there.
 ui_password() {
-    local title="$1" text="$2" out
+    local title="$1" text="$2" out rc=0
     if [[ "$USE_WHIPTAIL" == true ]]; then
-        if out=$(whiptail --title "$title" --passwordbox "$text" 10 58 \
-                     --ok-button "OK" --cancel-button "Back" 3>&1 1>&2 2>&3); then
-            printf '%s' "$out"
-            return 0
+        out=$(ui_box --title "$title" --passwordbox "$text" 10 58 \
+                     --ok-button "OK" --cancel-button "Back") || rc=$?
+        if (( rc == 255 )); then
+            return 2
         fi
-        return 1
+        (( rc != 0 )) && return 1
+        printf '%s' "$out"
+        return 0
     fi
-    printf '%s\n[hidden]: ' "$text" > /dev/tty
+    printf '%s\n[hidden] (ctrl-c cancels): ' "$text" > /dev/tty
     if ! IFS= read -rs out < /dev/tty; then
         die "console input closed (EOF) — aborting"
     fi
@@ -464,22 +591,20 @@ ui_password() {
     return 0
 }
 
-# ui_yesno TITLE TEXT DEFAULT(yes|no) -> rc 0 = yes, rc 1 = no.
+# ui_yesno TITLE TEXT DEFAULT(yes|no) -> rc 0 = yes, rc 1 = no, rc 2 = quit.
 ui_yesno() {
-    local title="$1" text="$2" default="$3" out rc
+    local title="$1" text="$2" default="$3" out rc=0
     if [[ "$USE_WHIPTAIL" == true ]]; then
-        if whiptail --title "$title" --yesno "$text" 10 58 \
-                --yes-button "Yes" --no-button "No" 3>&1 1>&2 2>&3; then
-            return 0
-        fi
-        rc=$?
-        if [[ $rc -eq 255 ]]; then
-            return 1   # Esc treated as No
-        fi
-        return 1
+        ui_box --title "$title" --yesno "$text" 10 58 \
+               --yes-button "Yes" --no-button "No" || rc=$?
+        case "$rc" in
+            0)    return 0 ;;
+            255)  return 2 ;;   # Esc: quit, zero changes
+            *)    return 1 ;;
+        esac
     fi
-    local hint="[y/N]"
-    [[ "$default" == yes ]] && hint="[Y/n]"
+    local hint="[y/N] (q=cancel)"
+    [[ "$default" == yes ]] && hint="[Y/n] (q=cancel)"
     while true; do
         printf '%s\n%s ' "$text" "$hint" > /dev/tty
         if ! IFS= read -r out < /dev/tty; then
@@ -488,17 +613,57 @@ ui_yesno() {
         case "${out:-$default}" in
             [Yy]|[Yy][Ee][Ss]) return 0 ;;
             [Nn]|[Nn][Oo])     return 1 ;;
-            *) printf "Please answer 'y' or 'n'.\n" > /dev/tty ;;
+            [Qq]|[Qq][Uu][Ii][Tt]|[Cc][Aa][Nn][Cc][Ee][Ll]) return 2 ;;
+            *) printf "Please answer 'y', 'n', or 'q' to quit.\n" > /dev/tty ;;
         esac
     done
 }
 
 ui_msg() {
     if [[ "$USE_WHIPTAIL" == true ]]; then
-        whiptail --title "Attention" --msgbox "$1" 12 58 3>&1 1>&2 2>&3 || true
+        ui_box --title "Attention" --msgbox "$1" 12 58 || true
     else
         printf '%s\n' "$1" > /dev/tty
     fi
+}
+
+# ui_menu TITLE TEXT TAG DESC [TAG DESC ...] -> echoes the chosen TAG.
+# rc 0 = ok, rc 1 = back (Cancel), rc 2 = quit (Esc / 'quit').
+ui_menu() {
+    local title="$1" text="$2"; shift 2
+    local out rc=0 i=1 line
+    local -a tags=()
+    if [[ "$USE_WHIPTAIL" == true ]]; then
+        out=$(ui_box --title "$title" --menu "$text" 16 62 8 "$@" \
+                     --ok-button "OK" --cancel-button "Back") || rc=$?
+        case "$rc" in
+            0)    printf '%s' "$out"; return 0 ;;
+            255)  return 2 ;;
+            *)    return 1 ;;
+        esac
+    fi
+    while [[ $# -gt 1 ]]; do
+        tags+=("$1")
+        printf '  %d) %s\n' "$i" "$1" > /dev/tty
+        i=$((i + 1)); shift 2
+    done
+    printf '%s\n' "$text" > /dev/tty
+    while true; do
+        printf 'Choose a number (or "quit"): ' > /dev/tty
+        if ! IFS= read -r line < /dev/tty; then
+            die "console input closed (EOF) — aborting"
+        fi
+        case "$line" in
+            [Qq][Uu][Ii][Tt]|[Cc][Aa][Nn][Cc][Ee][Ll]) return 2 ;;
+            "" | *[!0-9]*) printf "Enter the number of your choice, or 'quit'.\n" > /dev/tty ;;
+            *)
+                if (( line >= 1 && line <= ${#tags[@]} )); then
+                    printf '%s' "${tags[$((line - 1))]}"
+                    return 0
+                fi
+                printf 'Invalid choice.\n' > /dev/tty ;;
+        esac
+    done
 }
 
 # ─────────────────────────────────────────────────────────────
@@ -614,8 +779,13 @@ load_state() {
                 MAINT_TIME)           OLD_MAINT_TIME="$val" ;;
                 CRUSTY_CREATED_USER)  OLD_CREATED_USER="$val" ;;
                 CRUSTY_USER_UID)      OLD_USER_UID="$val" ;;
+                SUDO)                 OLD_SUDO="$val" ;;
                 SUDO_ADDED)           OLD_SUDO_ADDED="$val" ;;
+                SSH_KEY_FP)           OLD_SSH_KEY_FP="$val" ;;
                 DOCKER_GROUP_ADDED)   OLD_DGROUP_ADDED="$val" ;;
+                FW_STACK)             OLD_FW_STACK="$val" ;;
+                FW_EXTRA_ALLOW)       OLD_FW_EXTRA_ALLOW="$val" ;;
+                FW_ACK)               OLD_FW_ACK="$val" ;;
             esac
         done < "$STATE_FILE"
         log_note "previous crusty state found (user=${OLD_TARGET_USER:-?}, port=${OLD_SSH_PORT:-?})"
@@ -623,7 +793,7 @@ load_state() {
 }
 
 # ─────────────────────────────────────────────────────────────
-# Wizard — collect EVERYTHING first (≤8 prompts), then plan+confirm.
+# Wizard — collect EVERYTHING first (9 prompts), then plan+confirm.
 # Cancel on step 1 exits; cancel on later steps goes back one step.
 # ─────────────────────────────────────────────────────────────
 
@@ -635,20 +805,26 @@ wizard() {
         prompt_ssh_key
         prompt_port
         prompt_modules
+        prompt_firewall
         prompt_docker_user
         prompt_maint_time
     )
-    local i=0
+    local i=0 rc=0
     while (( i < ${#steps[@]} )); do
-        if "${steps[$i]}"; then
-            i=$((i + 1))
-        else
-            if (( i == 0 )); then
-                log_note "cancelled at the first prompt — nothing was changed"
-                exit 0
-            fi
-            i=$((i - 1))
-        fi
+        "${steps[$i]}"
+        rc=$?
+        case $rc in
+            0)   i=$((i + 1)) ;;
+            2)   log_note "quit requested — nothing was changed"
+                 exit 0 ;;
+            *)   # rc 1 = back one step; rc 255 = Esc handled earlier
+                if (( i == 0 )); then
+                    log_note "cancelled at the first prompt — nothing was changed"
+                    exit 0
+                fi
+                i=$((i - 1))
+                ;;
+        esac
     done
 }
 
@@ -665,11 +841,15 @@ prompt_user() {
         return 0
     fi
     local default="${SUDO_USER:-${OLD_TARGET_USER:-admin}}"
-    local answer
+    local answer rc=0
     while true; do
         answer=$(ui_input "Admin user" \
             "Dedicated non-root admin user. Created if absent, reused if present. Never root (C1)." \
-            "$default") || return 1
+            "$default") || rc=$?
+        case $rc in
+            2) return 2 ;;
+            1) return 1 ;;
+        esac
         if [[ "$answer" == "root" ]]; then
             ui_msg "REFUSING root: crusty sets PermitRootLogin no — a root-only key is a guaranteed lockout (C1)."
             continue
@@ -694,12 +874,20 @@ prompt_password() {
         log_note "--yes: password left as-is (new users stay locked, key-only)"
         return 0
     fi
-    local p1 p2
+    local p1 p2 rc=0
     while true; do
         p1=$(ui_password "Password (1/2)" \
             "Set a password for the admin user.
-Leave EMPTY to skip (new/locked accounts become key-only; existing passwords are NOT touched).") || return 1
-        p2=$(ui_password "Password (2/2)" "Repeat the password (must match).") || return 1
+Leave EMPTY to skip (new/locked accounts become key-only; existing passwords are NOT touched).") || rc=$?
+        case $rc in
+            2) return 2 ;;
+            1) return 1 ;;
+        esac
+        p2=$(ui_password "Password (2/2)" "Repeat the password (must match).") || rc=$?
+        case $rc in
+            2) return 2 ;;
+            1) return 1 ;;
+        esac
         if [[ -z "$p1" && -z "$p2" ]]; then
             SET_PASSWORD=""
             return 0
@@ -715,46 +903,56 @@ Leave EMPTY to skip (new/locked accounts become key-only; existing passwords are
 
 prompt_sudo() {
     if [[ -z "$GRANT_SUDO" && "$ASSUME_YES" == true ]]; then
-        GRANT_SUDO="$(sudo_default)"
+        GRANT_SUDO="${OLD_SUDO:-$(sudo_default)}"
         return 0
     fi
     if [[ -z "$GRANT_SUDO" && "$HAVE_TTY" != true ]]; then
-        GRANT_SUDO="$(sudo_default)"
+        GRANT_SUDO="${OLD_SUDO:-$(sudo_default)}"
         return 0
     fi
     if [[ -n "$GRANT_SUDO" ]]; then
         return 0
     fi
-    local def
-    def="$(sudo_default)"
+    local def rc=0
+    # Re-run convergence: pre-fill the PREVIOUS choice, not the fresh default
+    def="${OLD_SUDO:-$(sudo_default)}"
     local text
     text="Add '$TARGET_USER' to the 'sudo' group?
 (LXC default: no — the PVE console is the admin path.
 VM/bare-metal default: yes.)"
-    if ui_yesno "Sudo access" "$text" "$def"; then
-        GRANT_SUDO="yes"
-    else
-        GRANT_SUDO="no"
-    fi
+    ui_yesno "Sudo access" "$text" "$def"
+    rc=$?
+    case $rc in
+        2) return 2 ;;
+        0) GRANT_SUDO="yes" ;;
+        1) GRANT_SUDO="no" ;;
+    esac
+    [[ "$def" != "$GRANT_SUDO" ]] && OLD_SUDO=""   # diverge from state -> plan shows the change
     return 0
 }
 
-prompt_ssh_key() {
-    if [[ -n "$USER_PUBLIC_KEY" ]]; then
-        return 0    # pre-filled and validated by --ssh-key
-    fi
-    if [[ "$HAVE_TTY" != true ]]; then
-        die "headless run requires --ssh-key"
-    fi
-    local answer key
+paste_key_prompt() {
+    local answer rc=0 key
     while true; do
         answer=$(ui_input "SSH public key" \
             "Paste your SSH PUBLIC key (ssh-ed25519 AAAA... user@host) or a path to a .pub file.
 A key is REQUIRED: password auth will be disabled." \
-            "") || return 1
+            "" "$(ui_key_width)") || rc=$?
+        case $rc in
+            2) return 2 ;;
+            1) return 1 ;;
+        esac
         key="$(resolve_key_input "$answer")"
         if [[ -z "$key" ]]; then
             ui_msg "The key cannot be empty — password auth will be disabled, so a key is mandatory."
+            continue
+        fi
+        # Paste/UI wedge guard: an over-long paste (wedged terminal buffer,
+        # accidental multi-line dump) is REJECTED with a clear message instead
+        # of being silently truncated by the input box / validator.
+        if key_overlong "$key"; then
+            ui_msg "Pasted input is ${#key} characters — above the ${KEY_MAX_LEN}-char cap.
+This is usually a wedged terminal paste, not a key. Re-paste a single public key (max ${KEY_MAX_LEN} chars)."
             continue
         fi
         if ! validate_public_key "$key"; then
@@ -767,6 +965,125 @@ Valid types: ssh-ed25519, ssh-rsa, ssh-dss, ecdsa-sha2-nistp256|384|521, sk-ssh-
     done
 }
 
+view_keys() {
+    local out="Installed keys for '$TARGET_USER':" line
+    local i k fp
+    if [[ ${#EXISTING_KEYS[@]} -eq 0 ]]; then
+        ui_msg "No installed keys found for '$TARGET_USER'."
+        return 0
+    fi
+    for i in "${!EXISTING_KEYS[@]}"; do
+        k="${EXISTING_KEYS[$i]}"
+        fp=""
+        if command -v ssh-keygen &>/dev/null; then
+            fp="$(printf '%s\n' "$k" | ssh-keygen -lf - 2>/dev/null | awk '{print $2}')"
+        fi
+        out+="\n[$((i + 1))] ${fp:-${k:0:60}}"
+    done
+    ui_msg "$out"
+    return 0
+}
+
+# Remove one installed key. LOCKOUT-SAFETY: refusing to remove the LAST key
+# (password auth is disabled — a zero-key box is lockout by construction),
+# unless a replacement is being added in the same run.
+remove_key_prompt() {
+    local rc=0 choice i k desc
+    local -a tags=()
+    for i in "${!EXISTING_KEYS[@]}"; do
+        k="${EXISTING_KEYS[$i]}"
+        desc="${k:0:70}"
+        tags+=("$i" "$desc")
+    done
+    choice=$(ui_menu "Remove a key" \
+        "Pick the key to REMOVE (shown in the plan; keys are never removed implicitly):" \
+        "${tags[@]}") || rc=$?
+    case $rc in
+        2) return 2 ;;
+        1) return 1 ;;
+    esac
+    if [[ ${#REMOVE_KEYS[@]} -eq 0 && ${#EXISTING_KEYS[@]} -le 1 && -z "$USER_PUBLIC_KEY" ]]; then
+        ui_msg "REFUSING: that is the LAST installed key. Removing it leaves no way in
+(password auth is disabled by crusty). Add a replacement key first, or keep this one."
+        return 0
+    fi
+    REMOVE_KEYS+=("${EXISTING_KEYS[10#$choice]}")
+    unset 'EXISTING_KEYS[10#'"$choice"']'
+    # collapse the array to drop the hole
+    local -a shifted=()
+    for k in "${EXISTING_KEYS[@]}"; do shifted+=("$k"); done
+    EXISTING_KEYS=("${shifted[@]}")
+    log_note "queued removal of key ${REMOVE_KEYS[-1]:0:60}... (explicit)"
+    return 0
+}
+
+key_management_menu() {
+    local rc=0 choice
+    while true; do
+        choice=$(ui_menu "SSH keys" \
+            "Manage installed keys for '$TARGET_USER' (re-run keep/add/view/remove):" \
+            keep   "Keep existing key(s) — no changes" \
+            add    "Add a new key (paste another)" \
+            view   "View installed keys" \
+            remove "Remove an installed key (explicit)" \
+            quit   "Quit — no changes") || rc=$?
+        case $rc in
+            2) return 2 ;;
+            1) return 1 ;;
+        esac
+        case "$choice" in
+            keep)
+                KEEP_KEYS=true
+                log_note "keeping existing keys as-is (user chose keep)"
+                return 0
+                ;;
+            add)
+                paste_key_prompt || return $?
+                return 0
+                ;;
+            view)
+                view_keys || return $?
+                ;;
+            remove)
+                remove_key_prompt || return $?
+                ;;
+            quit)
+                return 2
+                ;;
+        esac
+    done
+}
+
+prompt_ssh_key() {
+    if [[ -n "$USER_PUBLIC_KEY" ]]; then
+        return 0    # pre-filled and validated by --ssh-key
+    fi
+    if [[ "$KEEP_KEYS" == true ]]; then
+        return 0    # explicit --keep-keys (or keep chosen earlier)
+    fi
+    # State records a valid key for this user AND it is still on disk:
+    # headless/--yes re-runs (module flips only) must not be forced to
+    # re-declare a key (round-3 requirement). Key stays untouched.
+    if [[ -n "$OLD_SSH_KEY_FP" ]] && user_has_installed_key "$TARGET_USER" \
+       && { [[ "$HAVE_TTY" != true || "$ASSUME_YES" == true ]]; }; then
+        KEEP_KEYS=true
+        log_note "state records a valid key for '$TARGET_USER' — keeping existing keys (--ssh-key optional on re-runs)"
+        return 0
+    fi
+    if [[ "$HAVE_TTY" != true ]]; then
+        die "headless run requires --ssh-key (no key recorded in $STATE_FILE for '$TARGET_USER')"
+    fi
+    if [[ "$ASSUME_YES" == true ]]; then
+        die "--yes with no --ssh-key: no key recorded in $STATE_FILE for '$TARGET_USER' — pass --ssh-key (or drop --yes to use the menu)"
+    fi
+    collect_existing_keys "$TARGET_USER"
+    if [[ ${#EXISTING_KEYS[@]} -gt 0 ]]; then
+        key_management_menu || return $?
+        return 0
+    fi
+    paste_key_prompt
+}
+
 prompt_port() {
     if [[ "$SSH_PORT" != 22 ]]; then
         return 0    # pre-filled by --port
@@ -776,12 +1093,16 @@ prompt_port() {
         return 0
     fi
     local default="${OLD_SSH_PORT:-22}"
-    local answer
+    local answer rc=0 yn=0
     while true; do
         answer=$(ui_input "SSH port" \
             "SSH port to listen on (current: ${CURRENT_SSH_PORTS[*]}).
 22 is fine behind a parent firewall (PVE/WireGuard); a custom port only adds obscurity. 80/443 are refused." \
-            "$default") || return 1
+            "$default") || rc=$?
+        case $rc in
+            2) return 2 ;;
+            1) return 1 ;;
+        esac
         if ! validate_port "$answer"; then
             ui_msg "Port must be a number between 1 and 65535."
             continue
@@ -791,11 +1112,14 @@ prompt_port() {
             continue
         fi
         if (( 10#$answer < 1024 )) && [[ "$answer" != 22 ]]; then
-            if ! ui_yesno "SSH port < 1024" \
+            ui_yesno "SSH port < 1024" \
                 "Ports below 1024 are usually reserved for system services.
-Use port $answer anyway?" "no"; then
-                continue
-            fi
+Use port $answer anyway?" "no"
+            yn=$?
+            case $yn in
+                2) return 2 ;;
+                1) continue ;;
+            esac
         fi
         SSH_PORT="$answer"
         return 0
@@ -814,18 +1138,21 @@ prompt_modules() {
         return 0    # defaults: docker off, fail2ban on, maintenance on
     fi
     if [[ "$USE_WHIPTAIL" == true ]]; then
-        local out choices
-        if out=$(whiptail --title "Modules" --checklist \
-                "Choose what to install/configure (Space toggles):" 16 58 4 \
-                "fail2ban"    "Intrusion prevention (systemd backend)" ON \
-                "maintenance" "Weekly local apt maintenance cron"      ON \
-                "docker"      "Docker Engine + Compose (hardened)"     OFF \
-                3>&1 1>&2 2>&3); then
+        local out choices rc=0 yn=0 c
+        while true; do
+            out=$(ui_box --title "Modules" --checklist \
+                    "Choose what to install/configure (Space toggles):" 16 58 4 \
+                    "fail2ban"    "Intrusion prevention (systemd backend)" ON \
+                    "maintenance" "Weekly local apt maintenance cron"      ON \
+                    "docker"      "Docker Engine + Compose (hardened)"     OFF) || rc=$?
+            case $rc in
+                2) return 2 ;;    # Esc: quit, zero changes
+                1) return 1 ;;    # Cancel: back
+            esac
             ENABLE_FAIL2BAN=false
             ENABLE_MAINTENANCE=false
             ENABLE_DOCKER=false
             choices=$(printf '%s' "$out" | tr -s ' ' '\n')
-            local c
             for c in $choices; do
                 case "$c" in
                     fail2ban)    ENABLE_FAIL2BAN=true ;;
@@ -833,25 +1160,57 @@ prompt_modules() {
                     docker)      ENABLE_DOCKER=true ;;
                 esac
             done
+            # PITFALL GUARD (Guac/noVNC): whiptail checklist toggles (SPACE)
+            # can silently fail to register over remote consoles. If BOTH
+            # modules that DEFAULT ON come back unchecked with an empty
+            # selection (no manual toggle at all), re-confirm explicitly
+            # before proceeding — an empty OK here permanently disables
+            # fail2ban + maintenance while the operator believes they are on.
+            if [[ "$ENABLE_FAIL2BAN" != true && "$ENABLE_MAINTENANCE" != true ]]; then
+                ui_yesno "Module selection warning" \
+                    "fail2ban and maintenance BOTH came back unchecked with an empty selection.
+
+If you intended them ON and only pressed Enter, the checklist SPACE-toggles
+may not have registered over this console (known Guac/noVNC issue).
+
+Proceed with both DISABLED?" "no"
+                yn=$?
+                case $yn in
+                    2) return 2 ;;
+                    1) continue ;;    # re-show the checklist
+                    0) return 0 ;;    # operator confirms — proceed
+                esac
+            fi
             return 0
-        fi
-        return 1
+        done
     fi
-    # read fallback
-    if ui_yesno "fail2ban" "Install fail2ban (intrusion prevention)?" "yes"; then
-        ENABLE_FAIL2BAN=true
-    else
-        ENABLE_FAIL2BAN=false
-    fi
-    if ui_yesno "maintenance" "Enable weekly LOCAL maintenance (apt update/upgrade, conditional reboot)?" "yes"; then
-        ENABLE_MAINTENANCE=true
-    else
-        ENABLE_MAINTENANCE=false
-    fi
-    if ui_yesno "docker" "Install Docker Engine + Compose (hardened daemon)?" "no"; then
-        ENABLE_DOCKER=true
-    else
-        ENABLE_DOCKER=false
+    # read fallback — explicit quit word on every yes/no (rc 2)
+    local yn1=0 yn2=0 yn3=0
+    ui_yesno "fail2ban" "Install fail2ban (intrusion prevention)?" "yes"
+    yn1=$?
+    case $yn1 in
+        2) return 2 ;;
+        1) ENABLE_FAIL2BAN=false ;;
+        0) ENABLE_FAIL2BAN=true ;;
+    esac
+    ui_yesno "maintenance" "Enable weekly LOCAL maintenance (apt update/upgrade, conditional reboot)?" "yes"
+    yn2=$?
+    case $yn2 in
+        2) return 2 ;;
+        1) ENABLE_MAINTENANCE=false ;;
+        0) ENABLE_MAINTENANCE=true ;;
+    esac
+    ui_yesno "docker" "Install Docker Engine + Compose (hardened daemon)?" "no"
+    yn3=$?
+    case $yn3 in
+        2) return 2 ;;
+        1) ENABLE_DOCKER=false ;;
+        0) ENABLE_DOCKER=true ;;
+    esac
+    # same pitfall guard on the read fallback: both default-ON rejected
+    if [[ "$ENABLE_FAIL2BAN" != true && "$ENABLE_MAINTENANCE" != true ]]; then
+        ui_msg "NOTE: fail2ban and maintenance are both DISABLED — both default ON.
+You answered No to both; re-run with --fail2ban/--maintenance to flip."
     fi
     return 0
 }
@@ -867,12 +1226,16 @@ prompt_docker_user() {
         DOCKER_USER="$TARGET_USER"
         return 0
     fi
-    local answer
+    local answer rc=0
     while true; do
         answer=$(ui_input "Docker user" \
             "User added to the 'docker' group (root-equivalent on this host).
 Default: the admin user ($TARGET_USER)." \
-            "$TARGET_USER") || return 1
+            "$TARGET_USER") || rc=$?
+        case $rc in
+            2) return 2 ;;
+            1) return 1 ;;
+        esac
         if ! validate_username "$answer"; then
             ui_msg "Invalid username."
             continue
@@ -894,12 +1257,16 @@ prompt_maint_time() {
         return 0
     fi
     local default="${OLD_MAINT_TIME:-02:00}"
-    local answer
+    local answer rc=0
     while true; do
         answer=$(ui_input "Maintenance time" \
             "Weekly maintenance runs every Sunday at this time (24h HH:MM).
 It is LOCAL and never downloads anything." \
-            "$default") || return 1
+            "$default") || rc=$?
+        case $rc in
+            2) return 2 ;;
+            1) return 1 ;;
+        esac
         if ! validate_time "$answer"; then
             ui_msg "Use 24-hour HH:MM, e.g. 02:00 or 14:30."
             continue
@@ -908,6 +1275,237 @@ It is LOCAL and never downloads anything." \
         printf -v MAINT_MINUTE '%02d' "$((10#${BASH_REMATCH[2]}))"
         return 0
     done
+}
+
+# ─────────────────────────────────────────────────────────────
+# Firewall pre-flight (round-4, item 6) — detect the existing stack
+# BEFORE enabling UFW; WARN + ASK when a non-UFW stack is active;
+# review/remove pre-existing rules; one-shot allow for inbound
+# listeners default-deny would cut off.
+# ─────────────────────────────────────────────────────────────
+
+# Detect which firewall stack is live. Sets FW_STACK:
+#   none / ufw / inactive-ufw / firewalld / nft / iptables
+fw_detect_stack() {
+    FW_STACK="none"
+    if command -v ufw >/dev/null 2>&1; then
+        if ufw status 2>/dev/null | grep -q "Status: active"; then
+            FW_STACK="ufw"
+        else
+            FW_STACK="inactive-ufw"
+        fi
+    fi
+    if command -v firewall-cmd >/dev/null 2>&1 && command -v systemctl >/dev/null 2>&1 \
+       && systemctl is-active --quiet firewalld 2>/dev/null; then
+        FW_STACK="firewalld"
+        return 0
+    fi
+    # UFW/firewalld own the box; nothing to warn about layering on top.
+    if [[ "$FW_STACK" == "ufw" || "$FW_STACK" == "firewalld" ]]; then
+        return 0
+    fi
+    # nftables: count chains that are NOT owned by crusty's own modules
+    # (ufw- backend tables, f2b- fail2ban chains).
+    if command -v nft >/dev/null 2>&1; then
+        local nft_foreign
+        nft_foreign="$(nft list ruleset 2>/dev/null | grep -E 'chain ' | grep -vcE 'f2b-|ufw-' 2>/dev/null || true)"
+        if (( nft_foreign > 0 )); then
+            FW_STACK="nft"
+            return 0
+        fi
+    fi
+    if command -v iptables-save >/dev/null 2>&1; then
+        local ipt_foreign
+        ipt_foreign="$(iptables-save 2>/dev/null | grep -E '^\-A ' | grep -vcE 'f2b-|ufw-' 2>/dev/null || true)"
+        if (( ipt_foreign > 0 )); then
+            FW_STACK="iptables"
+            return 0
+        fi
+    fi
+    return 0
+}
+
+# Print existing UFW rules one per line as "<action> <port>/<proto>" — the
+# spec `ufw delete` understands (never rule numbers, which renumber). Uses
+# `ufw show added` (works even when inactive; ufw stores rules in files).
+# Rules already queued for removal (FW_REMOVE_RULES) are not listed again.
+fw_rule_specs() {
+    command -v ufw >/dev/null 2>&1 || return 0
+    local spec q
+    ufw show added 2>/dev/null | awk '$2 == "ALLOW" || $2 == "DENY" || $2 == "LIMIT" {
+        printf "%s %s\n", tolower($2), $1 }' | sort -u | while IFS= read -r spec; do
+        for q in "${FW_REMOVE_RULES[@]:-}"; do
+            [[ "$spec" == "$q" ]] && continue 2
+        done
+        printf '%s\n' "$spec"
+    done
+}
+
+# Count pre-existing rules for the plan display and the wizard review step.
+fw_count_rules() {
+    fw_rule_specs | sed '/^$/d' | wc -l | tr -d ' '
+}
+
+# Print the running service + port for each TCP listener, one per line:
+#   "8080 <service>"  (ss -tlnp; no process info when unprivileged)
+fw_listener_lines() {
+    command -v ss >/dev/null 2>&1 || { echo "(ss not available) 0 unknown"; return 0; }
+    ss -tlnp 2>/dev/null | awk 'NR>1 {
+        split($4, a, ":"); port=a[length(a)];
+        if (port !~ /^[0-9]+$/) next;
+        svc=$6; sub(/^users:\(\("/, "", svc); sub(/".*/, "", svc);
+        printf "%s %s\n", port, (svc=="" ? "unknown" : svc)
+    }' | sort -n -u
+}
+
+# ─────────────────────────────────────────────────────────────
+# Wizard step — firewall pre-flight (round-4, item 6)
+# ─────────────────────────────────────────────────────────────
+prompt_firewall() {
+    FW_OPERATOR_ACK=false
+    FW_REVIEWED=false
+    FW_RULES_SEEN=0
+    FW_ALLOW_EXTRA=()
+    FW_REMOVE_RULES=()
+
+    fw_detect_stack
+
+    # --no-firewall: flag-forced opt-out outranks everything (even a previous
+    # acknowledged run). Recorded in state so a converged re-run stays quiet.
+    if [[ "$FW_OPT_OUT" == true ]]; then
+        log_note "--no-firewall: UFW will be skipped regardless of stack"
+        UFW_SKIPPED=true
+        return 0
+    fi
+
+    # Headless / --yes: restore the previously allowed listeners into the plan
+    # and apply. The allow itself is idempotent (I4), so an identical re-run
+    # stays at zero changes — but the state's FW_EXTRA_ALLOW is the source of
+    # truth for what must stay open across runs (round-4, item 6(c)).
+    if [[ "$HAVE_TTY" != true || "$ASSUME_YES" == true ]] && [[ -n "$OLD_FW_EXTRA_ALLOW" ]]; then
+        FW_ALLOW_EXTRA=()
+        local _p
+        for _p in $OLD_FW_EXTRA_ALLOW; do FW_ALLOW_EXTRA+=("$_p"); done
+        log_note "restoring previously allowed listeners: ${FW_ALLOW_EXTRA[*]}"
+    fi
+
+    # (a) non-UFW stack active: WARN + ASK instead of silently layering UFW.
+    if [[ "$FW_STACK" != "none" && "$FW_STACK" != "ufw" && "$FW_STACK" != "inactive-ufw" ]]; then
+        # Converged re-run: same stack, already decided (either way) — no re-ask,
+        # unless --firewall explicitly overrides a previous skip.
+        if [[ "$OLD_FW_STACK" == "$FW_STACK" && -n "$OLD_FW_ACK" ]]; then
+            if [[ "$FW_OPT_IN" == true && "$OLD_FW_ACK" != "yes" ]]; then
+                FW_OPERATOR_ACK=true
+                log_note "--firewall: overriding the previous skip of $FW_STACK — UFW will be layered"
+            elif [[ "$OLD_FW_ACK" == "yes" || "$FW_OPT_IN" == true ]]; then
+                FW_OPERATOR_ACK=true
+                log_note "firewall stack $FW_STACK unchanged since the acknowledged run — reusing that decision"
+            else
+                log_note "UFW skipped in a previous run (stack $FW_STACK kept) — reusing that decision"
+                UFW_SKIPPED=true
+                return 0
+            fi
+        elif [[ "$HAVE_TTY" != true || "$ASSUME_YES" == true ]]; then
+            log_warn "[!] non-UFW firewall stack detected: $FW_STACK — refusing to silently layer UFW on top"
+            log_warn "[!] UFW skipped; existing $FW_STACK stack kept (state: FW_ACK=no). Re-run with --firewall to override."
+            UFW_SKIPPED=true
+            return 0
+        else
+            local text
+            text="A NON-UFW firewall stack is ACTIVE on this box: $FW_STACK.\n\nUFW would be layered ON TOP of it. Existing rules are never reset (M6), but two stacks can fight over the same chains.\n\nProceed with UFW anyway?"
+            ui_yesno "Existing firewall detected" "$text" "no"
+            case $? in
+                2) return 2 ;;
+                1) log_note "UFW skipped — keeping the existing $FW_STACK stack"
+                   UFW_SKIPPED=true
+                   return 0 ;;
+                0) FW_OPERATOR_ACK=true
+                   log_note "operator acknowledged layering UFW on top of $FW_STACK" ;;
+            esac
+        fi
+    fi
+
+    if [[ "$UFW_SKIPPED" == true || "$HAVE_TTY" != true || "$ASSUME_YES" == true ]]; then
+        return 0
+    fi
+
+    # (b) show existing rules; operator may review and remove from inside crusty.
+    if command -v ufw >/dev/null 2>&1; then
+        FW_RULES_SEEN="$(fw_count_rules)"
+        if (( FW_RULES_SEEN > 0 )); then
+            local rules
+            rules="$(fw_rule_specs)"
+            ui_msg "Existing UFW rules ($FW_RULES_SEEN) — crusty never resets or hides these:
+$rules"
+            ui_yesno "Review existing rules" "Remove any pre-existing UFW rule as part of this run? (each removal is explicit and shown in the plan)" "no"
+            local yn=$?
+            case $yn in
+                2) return 2 ;;
+                1) FW_REVIEWED=true ;;
+                0)
+                    FW_REVIEWED=true
+                    local spec rc=0 choice i
+                    while true; do
+                        local -a opts=()
+                        i=0
+                        while IFS= read -r spec; do
+                            [[ -n "$spec" ]] || continue
+                            i=$((i + 1))
+                            opts+=("$i" "$spec")
+                        done < <(fw_rule_specs)
+                        (( ${#opts[@]} > 0 )) || { ui_msg "No removable rules left."; break; }
+                        choice=$(ui_menu "Remove a rule" "Pick a pre-existing UFW rule to REMOVE (explicit; shown in the plan)." \
+                            "${opts[@]}" \
+                            "done" "Stop removing rules") || rc=$?
+                        case $rc in
+                            2) return 2 ;;
+                            1) break ;;
+                        esac
+                        [[ "$choice" == "done" ]] && break
+                        spec="$(fw_rule_specs | sed -n "${choice}p")"
+                        [[ -z "$spec" ]] && { ui_msg "No such rule."; continue; }
+                        FW_REMOVE_RULES+=("$spec")
+                        log_note "queued removal: ufw delete $spec (explicit)"
+                    done
+                    ;;
+            esac
+        fi
+    fi
+
+    # (c) inbound listeners default-deny would cut off: warn + one-shot allow.
+    local -A allowed=()
+    local p spec_line
+    for p in "${CURRENT_SSH_PORTS[@]}" "$SSH_PORT"; do allowed[$p]=1; done
+    while IFS= read -r spec_line; do
+        [[ -z "$spec_line" ]] && continue
+        p="${spec_line##* }"; p="${p%%/*}"
+        allowed[$p]=1
+    done < <(fw_rule_specs)
+    local -a cutoff=()
+    local port svcname entry list=""
+    while read -r port svcname; do
+        [[ -n "$port" ]] || continue
+        [[ -n "${allowed[$port]:-}" ]] && continue
+        cutoff+=("$port/$svcname")
+    done < <(fw_listener_lines)
+    if [[ ${#cutoff[@]} -gt 0 ]]; then
+        for entry in "${cutoff[@]}"; do
+            list+="  ${entry%%/*}  (${entry#*/})\n"
+        done
+        local warn_text
+        warn_text="Default-deny incoming would cut off these services:
+$list
+Allow them through UFW now? (one-shot; removed rules stay removed)"
+        ui_yesno "Services affected by default-deny" "$warn_text" "yes"
+        local yn2=$?
+        case $yn2 in
+            2) return 2 ;;
+            1) log_note "listeners NOT auto-allowed — they will be cut off by default-deny" ;;
+            0) for entry in "${cutoff[@]}"; do FW_ALLOW_EXTRA+=("${entry%%/*}"); done
+               log_note "queued allow: ${FW_ALLOW_EXTRA[*]} (inbound listener pre-flight)" ;;
+        esac
+    fi
+    return 0
 }
 
 # ─────────────────────────────────────────────────────────────
@@ -927,6 +1525,16 @@ plan_display() {
     fi
     local sudo_note="no"
     [[ "$GRANT_SUDO" == yes ]] && sudo_note="yes (docker group independent)"
+    local key_note="ADD new key"
+    if [[ "$KEEP_KEYS" == true ]]; then
+        key_note="KEEP existing key(s) — no key changes"
+    elif [[ ${#REMOVE_KEYS[@]} -gt 0 ]]; then
+        key_note="ADD new key + REMOVE ${#REMOVE_KEYS[@]} explicit"
+    elif [[ -n "$USER_PUBLIC_KEY" ]]; then
+        key_note="ADD: ${USER_PUBLIC_KEY:0:40}..."
+    fi
+    local mod_flags=""
+    mod_flags="fail2ban=$([[ "$ENABLE_FAIL2BAN" == true ]] && printf 'ON' || printf OFF) maintenance=$([[ "$ENABLE_MAINTENANCE" == true ]] && printf 'ON' || printf OFF) docker=$([[ "$ENABLE_DOCKER" == true ]] && printf 'ON' || printf OFF)"
     local mod_note=""
     if is_container; then
         mod_note="
@@ -946,6 +1554,28 @@ plan_display() {
         fi
     fi
 
+    # Firewall pre-flight summary (round-4, item 6)
+    local fw_note="UFW will be enabled (stack: $FW_STACK)"
+    if [[ "$UFW_SKIPPED" == true ]]; then
+        fw_note="UFW SKIPPED"
+        if [[ "$FW_STACK" != "none" && "$FW_STACK" != "ufw" ]]; then
+            fw_note="UFW SKIPPED — existing $FW_STACK stack kept (no layering)"
+        fi
+    elif [[ "$FW_OPERATOR_ACK" == true ]]; then
+        fw_note="UFW layered ON TOP of existing $FW_STACK (operator acknowledged)"
+    fi
+    local fw_actions=""
+    if [[ ${#FW_REMOVE_RULES[@]} -gt 0 ]]; then
+        fw_actions+="\n    REMOVE pre-existing: ${FW_REMOVE_RULES[*]} (explicit)"
+    fi
+    if [[ ${#FW_ALLOW_EXTRA[@]} -gt 0 ]]; then
+        fw_actions+="\n    ALLOW listeners: ${FW_ALLOW_EXTRA[*]} (pre-flight one-shot)"
+    fi
+    if (( FW_RULES_SEEN > 0 )) && [[ "$UFW_SKIPPED" != true ]]; then
+        fw_actions+="\n    Existing UFW rules ($FW_RULES_SEEN) PRESERVED — never reset (M6)"
+        [[ "$FW_REVIEWED" == true ]] && fw_actions+=" (reviewed by operator)"
+    fi
+
     cat << EOF
 
 ================ crusty PLAN ================
@@ -953,12 +1583,15 @@ Environment      : $ENV_CLASS (Debian/Ubuntu)
 Admin user       : $TARGET_USER ($user_note)
 Password         : $pass_note
 Sudo group       : $sudo_note
+SSH key action   : $key_note
 SSH public key   : ${USER_PUBLIC_KEY:0:40}...
 SSH port         : ${CURRENT_SSH_PORTS[*]} -> $SSH_PORT
 TCP forwarding   : $ALLOW_TCP_FORWARDING (flag-only)
+MODULES          : $mod_flags
 Fail2ban         : $([[ "$ENABLE_FAIL2BAN" == true ]] && printf yes || printf no) (backend=systemd, reload-only)
 Maintenance cron  : $([[ "$ENABLE_MAINTENANCE" == true ]] && printf 'weekly Sunday %s (local, never downloads)' "${MAINT_HOUR}:${MAINT_MINUTE}" || printf no)
 Docker           : $([[ "$ENABLE_DOCKER" == true ]] && printf yes || printf no)$docker_note$mod_note
+Firewall         : $fw_note$fw_actions
 
 Artifacts crusty will own:
   - /etc/ssh/sshd_config (hardened; drop-ins neutralized, H4)
@@ -979,10 +1612,16 @@ confirm_plan() {
     if [[ "$HAVE_TTY" != true ]]; then
         die "no console for the final confirmation — headless runs need --yes"
     fi
+    local rc=0
     ui_yesno "Confirm" "Apply this plan now?
 A FINAL WARNING: this restarts sshd (existing sessions survive) and
 disables password authentication. Keep this session open until you have
-tested the new connection." "no" || die "cancelled at the final confirmation — nothing was changed"
+tested the new connection." "no"
+    rc=$?
+    case $rc in
+        2) log_note "quit requested at the final confirmation — nothing was changed"; exit 0 ;;
+        1) die "cancelled at the final confirmation — nothing was changed" ;;
+    esac
     return 0
 }
 
@@ -1171,7 +1810,30 @@ setup_authorized_keys() {
     local auth_keys_file="$ssh_dir/authorized_keys"
     local key_line="$USER_PUBLIC_KEY"
 
-    log "installing the public key for '$TARGET_USER' in $auth_keys_file"
+    # KEEP path (re-run, module flips only): nothing about keys changed —
+    # authorized_keys is NOT touched, so a keep-key re-run applies zero
+    # changes (idempotency invariant, round-3 requirement).
+    if [[ "$KEEP_KEYS" == true && -z "$key_line" && ${#REMOVE_KEYS[@]} -eq 0 ]]; then
+        log "[ok] keys left exactly as-is (keep path) — authorized_keys untouched"
+        SSH_KEY_FP="$(printf '%s\n' "${EXISTING_KEYS[0]:-}" | ssh-keygen -lf - 2>/dev/null | awk '{print $2}')"
+        return 0
+    fi
+
+    # LOCKOUT-SAFETY pre-checks (do them BEFORE any write):
+    # 1. If the ONLY change queued is a removal, never let it empty the file.
+    # 2. If we add a key AND remove some, the final set must be non-empty.
+    local remaining=0
+    if [[ -n "$key_line" ]]; then remaining=$((remaining + 1)); fi
+    remaining=$((remaining + ${#EXISTING_KEYS[@]} - ${#REMOVE_KEYS[@]}))
+    if (( remaining <= 0 )); then
+        die "REFUSING: this run would leave ZERO keys for '$TARGET_USER' (password auth is disabled — lockout by construction). Add a key or keep the existing ones."
+    fi
+    if [[ -z "$key_line" && ${#REMOVE_KEYS[@]} -eq 0 ]]; then
+        # KEEP path with no key action but REMOVE_KEYS empty — already handled above.
+        :
+    fi
+
+    log "updating public keys for '$TARGET_USER' in $auth_keys_file"
 
     # M5: warn about group/world-writable home — sshd StrictModes REFUSES
     # keys from such homes ("Authentication refused: bad ownership")
@@ -1200,32 +1862,70 @@ setup_authorized_keys() {
     mkdir -p "$ssh_dir"
     chmod 700 "$ssh_dir"
 
-    # M7: atomic, dedup-safe append — temp file in the same dir, then mv.
-    # Trailing whitespace in existing lines no longer defeats the dup check.
+    # M7: atomic, dedup-safe update — temp file in the same dir, then mv.
     local tmp="$auth_keys_file.tmp.$$"
     if [[ -f "$auth_keys_file" ]]; then
         cp "$auth_keys_file" "$tmp"
     fi
-    if awk -v k="$key_line" '{ gsub(/[[:space:]]+$/, ""); if ($0 == k) found=1 } END { exit found ? 0 : 1 }' "$tmp" 2>/dev/null; then
-        rm -f "$tmp"
-        log "[ok] public key already present — skipping (I2)"
-    else
-        printf '%s\n' "$key_line" >> "$tmp"
+
+    local changed=false k
+    # 1) Explicit removals first (operator-selected, shown in the plan).
+    if [[ ${#REMOVE_KEYS[@]} -gt 0 ]]; then
+        for k in "${REMOVE_KEYS[@]}"; do
+            if awk -v k="$k" '{ gsub(/[[:space:]]+$/, ""); if ($0 == k) found=1 } END { exit found ? 0 : 1 }' "$tmp" 2>/dev/null; then
+                # delete only the EXACT matching line(s) — nothing else moves
+                awk -v k="$k" '{ line=$0; gsub(/[[:space:]]+$/, "", line); if (line != k) print }' "$tmp" > "$tmp.new" && mv -f "$tmp.new" "$tmp"
+                changed=true
+                log "removed explicit key ${k:0:50}... from authorized_keys"
+            else
+                log_note "removal requested for a key that is not in authorized_keys — nothing to do: ${k:0:50}..."
+            fi
+        done
+        # NOTE: no CHANGES bump here — the single write at the bottom counts
+        # the whole operation once (removals+additions land in one mv).
+    fi
+
+    # 2) Addition (dedup-safe append) when a key was declared.
+    if [[ -n "$key_line" ]]; then
+        if [[ -f "$tmp" ]] && awk -v k="$key_line" '{ gsub(/[[:space:]]+$/, ""); if ($0 == k) found=1 } END { exit found ? 0 : 1 }' "$tmp" 2>/dev/null; then
+            log "[ok] public key already present — skipping (I2)"
+        else
+            printf '%s\n' "$key_line" >> "$tmp"
+            changed=true
+            log "public key appended to authorized_keys (atomic)"
+        fi
+    fi
+
+    if [[ "$changed" == true ]]; then
         chmod 600 "$tmp"
         mv -f "$tmp" "$auth_keys_file"
         CHANGES=$((CHANGES + 1))
-        log "public key appended to authorized_keys (atomic)"
+    else
+        rm -f "$tmp"
+        log "[ok] authorized_keys already converged — zero writes"
     fi
     chown -R "$TARGET_USER:" "$ssh_dir"
     chmod 700 "$ssh_dir"
     chmod 600 "$auth_keys_file"
     umask "$saved_umask"
 
-    # C1: verify the key actually landed BEFORE any auth restriction is applied
-    if ! grep -qF "$key_line" "$auth_keys_file"; then
-        die "Key verification FAILED — aborting before disabling root/password login."
+    # C1: verify the key actually landed BEFORE any auth restriction is applied.
+    # A keep-path run has nothing to verify (keys untouched by definition).
+    SSH_KEY_FP=""
+    if [[ -n "$key_line" ]]; then
+        if ! grep -qF "$key_line" "$auth_keys_file"; then
+            die "Key verification FAILED — aborting before disabling root/password login."
+        fi
+        SSH_KEY_FP="$(printf '%s\n' "$key_line" | ssh-keygen -lf - 2>/dev/null | awk '{print $2}')"
+        log "[ok] verified: key present in $auth_keys_file for $TARGET_USER"
+    elif [[ ${#REMOVE_KEYS[@]} -gt 0 ]]; then
+        # removals only: verify the file is non-empty and valid
+        collect_existing_keys "$TARGET_USER"
+        if [[ ${#EXISTING_KEYS[@]} -eq 0 ]]; then
+            die "Key verification FAILED after removals — no keys remain for '$TARGET_USER'; aborting before disabling password login."
+        fi
+        log "[ok] verified: ${#EXISTING_KEYS[@]} key(s) remain in $auth_keys_file for $TARGET_USER"
     fi
-    log "[ok] verified: key present in $auth_keys_file for $TARGET_USER"
 }
 
 # ─────────────────────────────────────────────────────────────
@@ -1518,6 +2218,23 @@ configure_firewall() {
         ufw_was_active=true
     fi
 
+    # Round-4, item 6(b): operator-queued removals of pre-existing rules.
+    # Explicit only, shown in the plan; spec-based delete survives renumbering.
+    local rem
+    for rem in "${FW_REMOVE_RULES[@]:-}"; do
+        [[ -n "$rem" ]] || continue
+        if ufw status 2>/dev/null | awk -v r="${rem##* }" '$1==r || $1==r"(v6)"' | grep -q .; then
+            if ufw --force delete "$rem" >/dev/null 2>&1; then
+                CHANGES=$((CHANGES + 1))
+                log "removed pre-existing rule (explicit): $rem"
+            else
+                log_note "ufw delete $rem returned an error — rule left as-is"
+            fi
+        else
+            log_note "rule to remove is not present — nothing to do (I4): $rem"
+        fi
+    done
+
     # M6: no 'ufw --force reset' — never destroy the operator's existing rules.
     # Idempotently make sure the new SSH port is allowed.
     if ! ufw status | awk -v rule="$SSH_PORT/tcp" '$1 == rule' | grep -q .; then
@@ -1527,6 +2244,20 @@ configure_firewall() {
     else
         log "[ok] $SSH_PORT/tcp already allowed (I4)"
     fi
+
+    # Round-4, item 6(c): one-shot allow for inbound listeners the operator
+    # chose to keep open before default-deny lands (the :8080 incident fix).
+    local extra
+    for extra in "${FW_ALLOW_EXTRA[@]:-}"; do
+        [[ -n "$extra" ]] || continue
+        if ufw status | awk -v rule="$extra/tcp" '$1 == rule' | grep -q .; then
+            log "[ok] $extra/tcp already allowed (I4)"
+        else
+            ufw allow "$extra"/tcp comment 'crusty-listener' >/dev/null
+            CHANGES=$((CHANGES + 1))
+            log "allowed $extra/tcp (inbound listener pre-flight)"
+        fi
+    done
 
     if [[ "$ufw_was_active" == false ]]; then
         ufw default deny incoming >/dev/null 2>&1
@@ -1889,6 +2620,7 @@ CRUSTY_USER_UID=$CRUSTY_USER_UID
 SSH_PORT=$SSH_PORT
 SUDO=$GRANT_SUDO
 SUDO_ADDED=$SUDO_ADDED
+SSH_KEY_FP=${SSH_KEY_FP:-}
 FAIL2BAN=$([[ "$ENABLE_FAIL2BAN" == true ]] && { [[ "$F2B_SKIPPED" == true ]] && printf skipped || printf enabled; } || printf disabled)
 UFW=$([[ "$UFW_SKIPPED" == true ]] && printf skipped || printf active)
 MAINTENANCE=$([[ "$ENABLE_MAINTENANCE" == true ]] && printf enabled || printf disabled)
@@ -1896,6 +2628,9 @@ MAINT_TIME=${MAINT_HOUR}:${MAINT_MINUTE}
 DOCKER=$DOCKER_RESULT
 DOCKER_USER=$([[ "$ENABLE_DOCKER" == true ]] && printf '%s' "$DOCKER_USER" || printf '')
 DOCKER_GROUP_ADDED=$DOCKER_GROUP_ADDED
+FW_STACK=$FW_STACK
+FW_EXTRA_ALLOW=$(IFS=' '; printf '%s' "${FW_ALLOW_EXTRA[*]}")
+FW_ACK=$([[ "$FW_OPERATOR_ACK" == true ]] && printf yes || printf no)
 ENV_CLASS=$ENV_CLASS
 EOF
     chmod 0644 "$STATE_FILE"
@@ -1919,6 +2654,13 @@ verify_and_summarize() {
     echo "================ crusty summary ================"
     echo "  Environment      : $ENV_CLASS"
     echo "  Admin user      : $TARGET_USER (created-by-crusty: $CRUSTY_CREATED_USER)"
+    local key_action="new key"
+    if [[ "$KEEP_KEYS" == true ]]; then
+        key_action="existing key(s) kept as-is"
+    elif [[ ${#REMOVE_KEYS[@]} -gt 0 ]]; then
+        key_action="new key + removed ${#REMOVE_KEYS[@]} explicit key(s)"
+    fi
+    echo "  SSH keys        : $key_action"
     local port_status="LISTENER NOT FOUND"
     if verify_ssh_listener "$SSH_PORT" >/dev/null 2>&1; then
         port_status="listener verified"
@@ -2186,7 +2928,7 @@ main() {
     load_state
     detect_current_ssh_ports
 
-    wizard                 # collect EVERYTHING (≤8 prompts), no mutations yet
+    wizard                 # collect EVERYTHING (9 prompts), no mutations yet
 
     plan_display
     if [[ "$DRY_RUN" == true ]]; then
